@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Engine">
+      <UniqueIdentifier>{1d6b2a10-4f3c-4c8e-9a7b-0a1f5b2c3d01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Game">
+      <UniqueIdentifier>{1d6b2a10-4f3c-4c8e-9a7b-0a1f5b2c3d02}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Rendering">
+      <UniqueIdentifier>{1d6b2a10-4f3c-4c8e-9a7b-0a1f5b2c3d03}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shaders">
+      <UniqueIdentifier>{1d6b2a10-4f3c-4c8e-9a7b-0a1f5b2c3d04}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\World.cpp"><Filter>Engine</Filter></ClCompile>
+    <ClCompile Include="src\CellSim.cpp"><Filter>Engine</Filter></ClCompile>
+    <ClCompile Include="src\Physics.cpp"><Filter>Engine</Filter></ClCompile>
+    <ClCompile Include="src\Tools.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\Player.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\Game.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\SelfTest.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\main.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\Mesher.cpp"><Filter>Rendering</Filter></ClCompile>
+    <ClCompile Include="src\Renderer.cpp"><Filter>Rendering</Filter></ClCompile>
+    <ClCompile Include="src\ViewModel.cpp"><Filter>Rendering</Filter></ClCompile>
+    <ClCompile Include="src\Png.cpp"><Filter>Rendering</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\VoxMath.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\Config.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\World.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\Physics.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\Tools.h"><Filter>Game</Filter></ClInclude>
+    <ClInclude Include="src\Player.h"><Filter>Game</Filter></ClInclude>
+    <ClInclude Include="src\Game.h"><Filter>Game</Filter></ClInclude>
+    <ClInclude Include="src\Log.h"><Filter>Game</Filter></ClInclude>
+    <ClInclude Include="src\Parallel.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\Profile.h"><Filter>Game</Filter></ClInclude>
+    <ClInclude Include="src\Mesher.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="src\Renderer.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="src\ViewModel.h"><Filter>Rendering</Filter></ClInclude>
+    <ClInclude Include="src\Png.h"><Filter>Rendering</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\common.hlsli"><Filter>Shaders</Filter></None>
+    <None Include="shaders\world.hlsl"><Filter>Shaders</Filter></None>
+    <None Include="shaders\sky.hlsl"><Filter>Shaders</Filter></None>
+    <None Include="shaders\line.hlsl"><Filter>Shaders</Filter></None>
+    <None Include="shaders\ui.hlsl"><Filter>Shaders</Filter></None>
+    <None Include="shaders\viewmodel.hlsl"><Filter>Shaders</Filter></None>
+  </ItemGroup>
+</Project>
