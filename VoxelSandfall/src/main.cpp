@@ -337,6 +337,21 @@ bool runScript(const std::string& path) {
                 for (int y = (int)(py - hs); y < (int)(py + hs); y++)
                     for (int x = (int)(px - hs); x < (int)(px + hs); x++) cells.push_back(IVec3(x, y, z));
             game.physics.createFromWorldCells(cells);
+        } else if (cmd == "dropball") {  // dropball x y z radius   (a free stone ball: a rigid body that falls and rolls)
+            float px, py, pz, pr;
+            ss >> px >> py >> pz >> pr;
+            std::vector<IVec3> cells;
+            for (int z = (int)(pz - pr) - 1; z <= (int)(pz + pr) + 1; z++)
+                for (int y = (int)(py - pr) - 1; y <= (int)(py + pr) + 1; y++)
+                    for (int x = (int)(px - pr) - 1; x <= (int)(px + pr) + 1; x++) {
+                        const float dx = x + 0.5f - px, dy = y + 0.5f - py, dz = z + 0.5f - pz;
+                        if (dx * dx + dy * dy + dz * dz <= pr * pr) cells.push_back(IVec3(x, y, z));
+                    }
+            if (!cells.empty()) game.physics.createFromWorldCells(cells);
+        } else if (cmd == "bodies") {  // bodies   (logs every rigid body and the player)
+            logLine("player pos=(%.1f %.1f %.1f) vel=(%.1f %.1f %.1f)", game.player.pos.x, game.player.pos.y, game.player.pos.z, game.player.vel.x, game.player.vel.y, game.player.vel.z);
+            for (auto& up : game.physics.bodies)
+                logLine("  body %d: %d voxels pos=(%.1f %.1f %.1f) vel=(%.1f %.1f %.1f) ang=%.2f sandF=(%.0f %.0f) %s", up->id, up->count, up->pos.x, up->pos.y, up->pos.z, up->vel.x, up->vel.y, up->vel.z, length(up->ang), up->sandF.x, up->sandF.z, up->asleep ? "asleep" : "awake");
         } else if (cmd == "impacts") {  // impacts on|off   (water splash / soak behaviour, for comparisons)
             std::string v;
             ss >> v;
@@ -368,6 +383,16 @@ bool runScript(const std::string& path) {
             int x0 = 1 << 30, y0 = 1 << 30, z0 = 1 << 30, x1 = -1, y1 = -1, z1 = -1;
             game.world.forEachInSphere(Vec3(px, py, pz), pr, [&](int x, int y, int z) {
                 game.world.setRaw(x, y, z, M_WATER);
+                x0 = std::min(x0, x); y0 = std::min(y0, y); z0 = std::min(z0, z);
+                x1 = std::max(x1, x); y1 = std::max(y1, y); z1 = std::max(z1, z);
+            });
+            if (x1 >= 0) game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "dropsand") {  // dropsand x y z radius   (a ball of sand appears in the air and falls)
+            float px, py, pz, pr;
+            ss >> px >> py >> pz >> pr;
+            int x0 = 1 << 30, y0 = 1 << 30, z0 = 1 << 30, x1 = -1, y1 = -1, z1 = -1;
+            game.world.forEachInSphere(Vec3(px, py, pz), pr, [&](int x, int y, int z) {
+                game.world.setRaw(x, y, z, M_SAND);
                 x0 = std::min(x0, x); y0 = std::min(y0, y); z0 = std::min(z0, z);
                 x1 = std::max(x1, x); y1 = std::max(y1, y); z1 = std::max(z1, z);
             });

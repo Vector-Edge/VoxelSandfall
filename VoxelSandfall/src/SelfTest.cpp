@@ -812,6 +812,90 @@ void testStreamingSimulation(Game& g) {
     CHECK(g.world.counts[M_WATER] == w2 && past > 100, "...and flows on into the new region once it is loaded (%d voxels beyond the old edge, %lld in total)", past, g.world.counts[M_WATER]);
 }
 
+// ---- pushing rocks around ----------------------------------------------------------------------------------
+std::vector<IVec3> ballCells(float px, float py, float pz, float r) {
+    std::vector<IVec3> cells;
+    for (int z = (int)(pz - r) - 1; z <= (int)(pz + r) + 1; z++)
+        for (int y = (int)(py - r) - 1; y <= (int)(py + r) + 1; y++)
+            for (int x = (int)(px - r) - 1; x <= (int)(px + r) + 1; x++) {
+                const float dx = x + 0.5f - px, dy = y + 0.5f - py, dz = z + 0.5f - pz;
+                if (dx * dx + dy * dy + dz * dz <= r * r) cells.push_back(IVec3(x, y, z));
+            }
+    return cells;
+}
+
+// A ball of the given radius resting on the floor at (x, z); returns the body.
+Body* dropBall(Game& g, float x, float z, float r) {
+    Body* b = g.physics.createFromWorldCells(ballCells(x, r + 1.5f, z, r));
+    runPhysics(g, 1.0f);
+    return b;
+}
+
+void testPushingRocks(Game& g) {
+    tlog("[the player pushes rocks: pebbles are walked over, footballs roll, boulders barely move]\n");
+    struct Case { const char* name; float r; };
+    const Case cases[] = {{"pebble", 1.5f}, {"football", 6.0f}, {"big rock", 11.0f}, {"boulder", 32.0f}};
+    float moved[4] = {0, 0, 0, 0}, progress[4] = {0, 0, 0, 0}, spin[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; i++) {
+        g.reset();
+        Body* b = dropBall(g, (float)cx(), (float)cz() - 40.0f, cases[i].r);
+        const float z0 = b->pos.z;
+        g.player.pos = Vec3((float)cx(), 1.0f, (float)cz() + 30.0f);
+        g.player.vel = Vec3(0, 0, 0);
+        g.player.yaw = 0;
+        GameInput in;
+        in.forward = 1;
+        for (int f = 0; f < 120; f++) {  // 2 s of walking straight at it
+            g.update(1.0f / 60.0f, in);
+            if (!g.physics.bodies.empty()) spin[i] = std::max(spin[i], length(g.physics.bodies[0]->ang));
+        }
+        moved[i] = z0 - g.physics.bodies[0]->pos.z;
+        progress[i] = (float)cz() + 30.0f - g.player.pos.z;
+        tlog("  %-8s (%d voxels): rock moved %.0f voxels, spun up to %.1f rad/s, the player advanced %.0f\n", cases[i].name, g.physics.bodies[0]->count, moved[i], spin[i], progress[i]);
+    }
+    CHECK(std::fabs(moved[0]) < 4.0f && progress[0] > 100.0f, "a pebble is simply walked over (it moved %.1f, the player went %.0f)", moved[0], progress[0]);
+    CHECK(moved[1] > 60.0f && spin[1] > 3.0f, "a football-sized rock rolls away from the player (%.0f voxels, %.1f rad/s)", moved[1], spin[1]);
+    CHECK(moved[2] > 8.0f && moved[2] < moved[1], "a bigger rock is pushed more slowly (%.0f voxels)", moved[2]);
+    CHECK(moved[3] > 3.0f && moved[3] < 0.5f * moved[2] + 1.0f && progress[3] < progress[1], "a boulder creeps (%.0f voxels) and holds the player back", moved[3]);
+}
+
+void testRocksAndSand(Game& g) {
+    tlog("[rocks and sand: balls roll down heaps and are pushed by them]\n");
+    // a ball on a sand slope rolls down it
+    g.reset();
+    for (int x = 100; x <= 160; x++) fillBox(g, M_SAND, x, x, 1, (x - 100) / 2 + 1, cz() - 25, cz() + 25);
+    settle(g, 20000);
+    Body* ball = g.physics.createFromWorldCells(ballCells(130.0f, 40.0f, (float)cz(), 8.0f));
+    const float x0 = ball->pos.x;
+    runPhysics(g, 4.0f);
+    tlog("  ball on a 1:2 sand slope: moved %.0f voxels along x\n", x0 - g.physics.bodies[0]->pos.x);
+    CHECK(x0 - g.physics.bodies[0]->pos.x > 40.0f, "a rock on a sand slope rolls down it");
+
+    struct Case { const char* name; float r; int x0, x1, y1; };
+    // sand piled in blocks against the left side of the rock (a stream of it)
+    auto pour = [&](float r, int blocks, int w, int h) {
+        g.reset();
+        Body* b = dropBall(g, (float)cx(), (float)cz(), r);
+        const float px = b->pos.x;
+        const int right = (int)(px - r) - 1;
+        for (int i = 0; i < blocks; i++) {
+            fillBox(g, M_SAND, right - w, right - 2, 30, 30 + h, cz() - (int)r - 8, cz() + (int)r + 8);
+            runGame(g, 0.5f, GameInput());
+        }
+        runGame(g, 3.0f, GameInput());
+        return g.physics.bodies[0]->pos.x - px;
+    };
+    const float pebble = pour(2.0f, 4, 6, 6);
+    const float football = pour(8.0f, 8, 9, 8);
+    const float boulderLittle = pour(32.0f, 2, 5, 6);
+    const float boulderMuch = pour(32.0f, 8, 10, 10);
+    tlog("  pushed to the right by sand: pebble %.1f, football %.1f, boulder with a little sand %.1f, boulder with a lot %.1f\n", pebble, football, boulderLittle, boulderMuch);
+    CHECK(pebble > 8.0f, "a pebble is carried off by a little sand (%.1f voxels)", pebble);
+    CHECK(football > 6.0f, "a football-sized rock is rolled away by a stream of sand (%.1f voxels)", football);
+    CHECK(std::fabs(boulderLittle) < 0.5f, "a little sand does not move a boulder (%.2f voxels)", boulderLittle);
+    CHECK(boulderMuch < football, "and a lot of sand moves a boulder less than it moves a football (%.1f voxels)", boulderMuch);
+}
+
 void testWadingInWater(Game& g) {
     tlog("[wading through water]\n");
     g.reset();
@@ -1210,6 +1294,8 @@ int runSelfTest(const char* logPath) {
         testStreamingPersistence(*g);
         testStreamingSimulation(*g);
         g->setInfinite(false);
+        testPushingRocks(*g);
+        testRocksAndSand(*g);
         testDirtPile(*g);
         testDirtStructure(*g);
         testGrass(*g);

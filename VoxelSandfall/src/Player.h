@@ -24,6 +24,9 @@ public:
     // Called when a horizontal move is blocked by a slab of voxels [mn, mx] (inclusive cell box); returns true if
     // the slab was cleared (sand shoved aside) so the player may keep going.
     std::function<bool(const IVec3& mn, const IVec3& mx, int axis, int sign)> plowHook;
+    // Called when a horizontal move is blocked (and cannot step up) by the slab of cells [mn, mx]: shoves any rigid body there
+    // and returns the speed the player may keep going at, or a negative number when there is no body in the slab.
+    std::function<float(const IVec3& mn, const IVec3& mx, int axis, int sign, float speed)> pushHook;
 
     void respawn();
     void respawnAt(const Vec3& feet);  // standing still at `feet`, looking along -z

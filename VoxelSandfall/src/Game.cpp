@@ -4,6 +4,7 @@
 Game::Game() {
     reset();
     player.plowHook = [this](const IVec3& mn, const IVec3& mx, int axis, int sign) { return sandPlow(mn, mx, axis, sign); };
+    player.pushHook = [this](const IVec3& mn, const IVec3& mx, int axis, int sign, float speed) { return physics.pushFromPlayer(mn, mx, axis, sign, speed); };
 }
 
 void Game::reset() {

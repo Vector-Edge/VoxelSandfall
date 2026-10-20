@@ -112,8 +112,8 @@ void Player::moveHorizontal(const World& w, int axis, float d) {
     const float moved = sweepAxis(w, axis, d);
     const bool blocked = std::fabs(moved) < std::fabs(d) - 1e-3f;
     if (!blocked) return;
-    if (onGround) {  // first try stepping up onto a low ledge (sand slopes, rubble)
-        const Vec3 afterNormal = pos;
+    const Vec3 afterNormal = pos;
+    if (onGround) {  // first try stepping up onto a low ledge (sand slopes, rubble, pebbles)
         pos = start;
         const float up = sweepAxis(w, 1, cfg::STEP_HEIGHT);
         const float moved2 = sweepAxis(w, axis, d);
@@ -121,7 +121,29 @@ void Player::moveHorizontal(const World& w, int axis, float d) {
         const bool landed = down > -(up + 0.5f) + 1e-3f;
         if (landed && std::fabs(moved2) > std::fabs(moved) + 0.05f) return;
         pos = afterNormal;
-        // Too high to climb: wade through it, shoving loose sand aside.
+    }
+    // Too high to climb. A rock in the way is shoved (the heavier, the slower)...
+    if (pushHook) {
+        const float hw = cfg::PLAYER_W * 0.5f;
+        const int sgn = d > 0 ? 1 : -1;
+        const float face = sgn > 0 ? pos[axis] + hw : pos[axis] - hw;
+        const int k = sgn > 0 ? floorToInt(face) + 1 : floorToInt(face) - 1;
+        const int b = (axis + 1) % 3, c = (axis + 2) % 3;
+        const float mn[3] = {pos.x - hw, pos.y, pos.z - hw}, mx[3] = {pos.x + hw, pos.y + cfg::PLAYER_H, pos.z + hw};
+        IVec3 lo, hi;
+        lo[axis] = hi[axis] = k;
+        lo[b] = floorToInt(mn[b] + kEps);
+        hi[b] = (int)std::ceil(mx[b] - kEps) - 1;
+        lo[c] = floorToInt(mn[c] + kEps);
+        hi[c] = (int)std::ceil(mx[c] - kEps) - 1;
+        const float cap = pushHook(lo, hi, axis, sgn, std::fabs(vel[axis]));
+        if (cap >= 0) {
+            vel[axis] = sgn * std::min(std::fabs(vel[axis]), cap);
+            return;
+        }
+    }
+    if (onGround) {
+        // ...and loose sand is shoved aside.
         if (plowHook && !inWater) {
             pos = start;
             plowEnabled_ = true;

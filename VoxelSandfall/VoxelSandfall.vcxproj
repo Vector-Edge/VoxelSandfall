@@ -97,6 +97,7 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\Mesher.cpp" />
     <ClCompile Include="src\Physics.cpp" />
+    <ClCompile Include="src\BodyForces.cpp" />
     <ClCompile Include="src\Player.cpp" />
     <ClCompile Include="src\Png.cpp" />
     <ClCompile Include="src\Renderer.cpp" />

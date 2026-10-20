@@ -99,6 +99,16 @@ into several bodies, each inheriting the velocity of its piece.
 **Tools** — Creator: wireframe brush sphere, attaches to the targeted face or paints in free space (at a fixed distance).
 Gun: ray from the crosshair, red carve-radius preview, recoil + muzzle flash.
 
+**Pushing rocks around** (`BodyForces.cpp`) - a free rock is a real body you can shove and that the sand shoves back:
+* *The player pushes*: walking into a rock too tall to step on (the step-up is 6 voxels) shoves it. The player counts as ~5300 voxels of stone, so the
+  push speed is the walking speed times 5300 / (5300 + the rock's voxels): a football (~900 voxels) rolls away almost as fast as you walk, a 20 cm rock
+  is pushed slowly, a metre-wide boulder only creeps (~18 voxels/s minimum) and holds you back. Pebbles are low enough to be stepped over;
+* *Round rocks roll*: a roughly spherical body collides as a true sphere (its surface voxels are pulled onto a sphere for world contacts) and has little
+  rolling resistance, so a ball rolls down a sand slope and rolls away when pushed instead of tipping over the facets of its voxels. Blocky rocks slide / tip;
+* *Sand pushes back*: sand heaped against a body presses on it with lateral earth pressure (the weight of the sand column above each contact, reaching
+  3 voxels out so a heap that slumps back keeps pushing). Small things are carried along readily, a big boulder is not moved by a little sand (the
+  pressure is measured every ~1/15 s, much less often while asleep); when a body moves it wakes the sand that it left behind so the heap slumps after it.
+
 **Endless world / chunk loading** (`Stream.cpp`, `GameStream.cpp`) — the game starts in an endless world (`--arena` brings back the classic walled arena;
 scripts and tests default to the arena, `--infinite` / script `infinite on` switch). The voxel grid is a window of 15 x 15 *regions* (one region = one
 32 x 32 chunk column, full 256 height, so 480 x 480 voxels) around you, and it slides as you walk - you are always within a region of its middle, so the

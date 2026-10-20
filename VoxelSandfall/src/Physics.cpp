@@ -132,6 +132,24 @@ void Body::computeMassProps() {
     I.m[2][0] = (float)Ixz; I.m[2][1] = (float)Iyz; I.m[2][2] = (float)Izz;
     invIbody = I.inverse();
     radius = std::sqrt(maxR2) + 0.9f;
+    // A roughly spherical rock collides as a true sphere: its voxel surface has flat facets (a flat patch at the bottom, steps
+    // on the sides) that would make it tip over them instead of roll.
+    colPts = surf;
+    round = false;
+    if (surf.size() >= 8) {
+        float mn = 1e9f, mx = 0, sum = 0;
+        for (const Vec3& r : surf) {
+            const float l = length(r);
+            mn = std::min(mn, l);
+            mx = std::max(mx, l);
+            sum += l;
+        }
+        const float mean = sum / (float)surf.size();
+        if (mean > 0.5f && mx - mn < 0.12f * mean + 1.2f) {
+            round = true;
+            for (Vec3& r : colPts) r = r * (mean / std::max(length(r), 1e-4f));
+        }
+    }
     updateInertiaWorld();
 }
 
@@ -241,7 +259,10 @@ void Physics::rasterizeOverlay() {
         b.ovPos = b.pos;
         b.ovRot = b.rot;
         b.ovValid = true;
-        clearOverlay(b);
+        oldCells_.swap(b.ovCells);  // (to wake the sand that was held up by the cells this body leaves)
+        b.ovCells.clear();
+        for (uint32_t i : oldCells_)
+            if (w.overlay[i]) w.overlay[i]--;
         const Mat3 R = b.rot.toMat3();
         for (int k = 0; k < b.nz; k++)
             for (int j = 0; j < b.ny; j++)
@@ -260,6 +281,16 @@ void Physics::rasterizeOverlay() {
                     for (int x = x0; x <= x1; x++) mark(b, x, y, z);
         }
         b.ovDirty = false;
+        static const int nb[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (uint32_t i : oldCells_) {
+            if (w.overlay[i]) continue;  // still covered
+            int x, y, z;
+            w.cellOfIndex(i, x, y, z);
+            for (const auto& d : nb) {
+                const uint8_t m = w.get(x + d[0], y + d[1], z + d[2]);
+                if (m == M_SAND || m == M_WATER || m == M_DIRT) w.queueCell(x + d[0], y + d[1], z + d[2]);
+            }
+        }
     }
     bool any = false;
     for (auto& up : bodies)
@@ -283,7 +314,7 @@ void Physics::collideWorld(Body& a, std::vector<Contact>& out) {
         return;
 
     for (size_t si = 0; si < a.surf.size(); si++) {
-        const Vec3 p = a.pos + R * a.surf[si];
+        const Vec3 p = a.pos + R * a.colPts[si];
         const int x0 = floorToInt(p.x - kSphereR), x1 = floorToInt(p.x + kSphereR);
         const int y0 = floorToInt(p.y - kSphereR), y1 = floorToInt(p.y + kSphereR);
         const int z0 = floorToInt(p.z - kSphereR), z1 = floorToInt(p.z + kSphereR);
@@ -489,6 +520,8 @@ void Physics::step(float dt) {
         if (av > kMaxAngSpeed) b.ang *= kMaxAngSpeed / av;
     }
 
+    sandPressure(dt);  // heaped sand pushes bodies sideways
+
     // World contacts.
     for (auto& up : bodies)
         if (!up->asleep) collideWorld(*up, contacts_);
@@ -525,7 +558,7 @@ void Physics::step(float dt) {
         b.pos += b.vel * dt;
         b.rot = b.rot.integrate(b.ang, dt);
         // Air drag is tiny; touching bodies get rolling resistance so rubble comes to rest.
-        b.ang *= 1.0f / (1.0f + (b.touching ? 3.5f : 0.3f) * dt);
+        b.ang *= 1.0f / (1.0f + (b.touching ? (b.round ? 1.2f : 3.5f) : 0.3f) * dt);  // (a ball keeps rolling, rubble stops)
         if (b.touching) b.vel *= 1.0f / (1.0f + 0.35f * dt);
         b.updateInertiaWorld();
 

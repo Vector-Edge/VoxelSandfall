@@ -20,6 +20,8 @@ struct Body {
     float mass = 1, invMass = 1;
     Mat3 invIbody = Mat3::identity(), invIworld = Mat3::identity();
     std::vector<Vec3> surf;          // surface voxel centres relative to the COM (body frame)
+    std::vector<Vec3> colPts;        // where those collide with the world: the same points, or (round rocks) pulled onto a true sphere
+    bool round = false;              // roughly a ball: it collides as one, so it rolls instead of tipping over the facets of its voxels
     std::vector<Vec3> warm, warmPrev;  // per surface voxel warm-start impulses (normal, tangent1, tangent2)
     float radius = 1;                // bounding sphere radius about the COM
     bool asleep = false;
@@ -32,6 +34,8 @@ struct Body {
     Vec3 ovPos;                      // pose the overlay was last rasterised at
     Quat ovRot;
     bool ovValid = false;
+    Vec3 sandF, sandT;               // force / torque the sand heaped against the body pushes it with (re-measured now and then)
+    float sandTimer = 0;
 
     bool occupiedAt(int i, int j, int k) const {
         return (unsigned)i < (unsigned)nx && (unsigned)j < (unsigned)ny && (unsigned)k < (unsigned)nz &&
@@ -84,12 +88,19 @@ public:
     void rasterizeOverlay();  // keeps World::overlay in sync with the bodies (sand/water/player see them)
     void purgeDead();
     size_t awakeCount() const;
+    // The player (moving at `speed` along `axis` towards `sign`) is blocked by the slab of cells [lo, hi]: shoves the bodies in
+    // it (heavy ones barely move). Returns the speed the player can keep going at, or -1 when no body is in the slab.
+    float pushFromPlayer(const IVec3& lo, const IVec3& hi, int axis, int sign, float speed);
 
 private:
     void collideWorld(Body& a, std::vector<Contact>& out);
     void collidePair(Body& a, Body& b, std::vector<Contact>& out);
     void solve(std::vector<Contact>& cs, float dt);
     void clearOverlay(Body& b);
+    void sandPressure(float dt);
+    void evalSandPressure(Body& b);
+    std::vector<uint64_t> sandKeys_;
+    std::vector<uint32_t> oldCells_;
 
     std::vector<Contact> contacts_;
     std::vector<Body*> sortedBodies_;

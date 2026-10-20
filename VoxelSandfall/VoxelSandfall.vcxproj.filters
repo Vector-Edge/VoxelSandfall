@@ -18,6 +18,7 @@
     <ClCompile Include="src\World.cpp"><Filter>Engine</Filter></ClCompile>
     <ClCompile Include="src\CellSim.cpp"><Filter>Engine</Filter></ClCompile>
     <ClCompile Include="src\Physics.cpp"><Filter>Engine</Filter></ClCompile>
+    <ClCompile Include="src\BodyForces.cpp"><Filter>Engine</Filter></ClCompile>
     <ClCompile Include="src\Tools.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Player.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Game.cpp"><Filter>Game</Filter></ClCompile>
