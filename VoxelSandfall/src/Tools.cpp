@@ -9,6 +9,8 @@ const char* materialName(uint8_t m) {
         case M_WATER: return "WATER";
         case M_STONE: return "NORMAL STONE";
         case M_BEDROCK: return "PERMANENT STONE";
+        case M_DIRT: return "DIRT";
+        case M_GRASS: return "GRASS (grows on dirt only)";
         default: return "AIR";
     }
 }
@@ -300,7 +302,14 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
         if (!w.inBounds(x, y, z)) return;
         const uint8_t cur = w.get(x, y, z);
         if (w.overlayAt(x, y, z)) return;  // occupied by a rigid body
-        if (mat == M_SAND || mat == M_WATER) {
+        if (mat == M_GRASS) {  // grass only ever grows on settled dirt: the voxels of its surface skin turn into grass
+            if (w.paintGrass(x, y, z)) {
+                placed.add(x, y, z);
+                res.placed++;
+            }
+            return;
+        }
+        if (mat == M_SAND || mat == M_WATER || mat == M_DIRT) {
             if (cur != M_AIR) return;
         } else if (cur == M_STONE || cur == M_BEDROCK) {
             return;  // solids only replace empty space and loose material
@@ -309,6 +318,10 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
             return;  // never entomb the player
         if (mat == M_STONE) {
             cells.emplace_back(x, y, z);
+        } else if (mat == M_DIRT) {  // poured dirt falls, settles, and then holds its shape
+            w.setLooseDirt(x, y, z);
+            placed.add(x, y, z);
+            res.placed++;
         } else {
             w.setRaw(x, y, z, mat);
             placed.add(x, y, z);

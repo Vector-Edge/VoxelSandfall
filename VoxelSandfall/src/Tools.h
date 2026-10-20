@@ -7,7 +7,8 @@
 #include "World.h"
 
 // Material that the Creator tool paints (index into kPaintMaterials).
-constexpr uint8_t kPaintMaterials[4] = {M_SAND, M_WATER, M_STONE, M_BEDROCK};
+constexpr int kPaintMaterialCount = 6;
+constexpr uint8_t kPaintMaterials[kPaintMaterialCount] = {M_SAND, M_WATER, M_STONE, M_BEDROCK, M_DIRT, M_GRASS};
 const char* materialName(uint8_t m);
 
 struct SceneHit {

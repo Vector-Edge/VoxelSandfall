@@ -154,14 +154,16 @@ void greedyFaces(const uint8_t* pad, int N, int yLo, int yHi, const Vec3& origin
 
 }  // namespace
 
-void buildChunkMesh(const World& w, int cx, int cy, int cz, MeshData& opaque, MeshData& water) {
+namespace {
+// Fills the padded material grid of one chunk; returns false when the chunk is empty. yLo/yHi: local y range holding voxels.
+bool fillPad(const World& w, int cx, int cy, int cz, std::vector<uint8_t>& pad, int& yLo, int& yHi) {
     constexpr int N = World::CS, P = N + 2;
-    static thread_local std::vector<uint8_t> pad;
     pad.resize((size_t)P * P * P);
     const int ox = cx * N, oy = cy * N, oz = cz * N;
     const uint8_t* chunk = w.chunkData(w.chunkIndex(cx, cy, cz));
     bool any = false;
-    int yLo = N, yHi = -1;  // y-range (chunk-local) that contains non-air voxels
+    yLo = N;
+    yHi = -1;
     for (int z = 0; z < P; z++)
         for (int y = 0; y < P; y++) {
             uint8_t* row = &pad[(size_t)P * ((size_t)y + (size_t)P * (size_t)z)];
@@ -186,11 +188,52 @@ void buildChunkMesh(const World& w, int cx, int cy, int cz, MeshData& opaque, Me
                 for (int x = 0; x < P; x++) row[x] = w.getForMesh(ox + x - 1, oy + y - 1, oz + z - 1);
             }
         }
+    return any;
+}
+}  // namespace
+
+void buildChunkMesh(const World& w, int cx, int cy, int cz, MeshData& opaque, MeshData& water) {
+    constexpr int N = World::CS;
+    static thread_local std::vector<uint8_t> pad;
+    int yLo, yHi;
+    const bool any = fillPad(w, cx, cy, cz, pad, yLo, yHi);
     opaque.clear();
     water.clear();
     if (!any) return;
-    greedyFaces(pad.data(), N, yLo, yHi, Vec3((float)ox, (float)oy, (float)oz), false, opaque);
-    greedyFaces(pad.data(), N, yLo, yHi, Vec3((float)ox, (float)oy, (float)oz), true, water);
+    const Vec3 origin((float)(cx * N), (float)(cy * N), (float)(cz * N));
+    greedyFaces(pad.data(), N, yLo, yHi, origin, false, opaque);
+    greedyFaces(pad.data(), N, yLo, yHi, origin, true, water);
+}
+
+void buildChunkWaterMesh(const World& w, int cx, int cy, int cz, MeshData& water) {
+    constexpr int N = World::CS;
+    static thread_local std::vector<uint8_t> pad;
+    int yLo, yHi;
+    const bool any = fillPad(w, cx, cy, cz, pad, yLo, yHi);
+    water.clear();
+    if (!any) return;
+    greedyFaces(pad.data(), N, yLo, yHi, Vec3((float)(cx * N), (float)(cy * N), (float)(cz * N)), true, water);
+}
+
+void waterTopsOfMesh(const MeshData& water, int cx, int cy, int cz, uint8_t out[1024]) {
+    std::memset(out, 0, 1024);
+    const int ox = cx * World::CS, oy = cy * World::CS, oz = cz * World::CS;
+    for (size_t q = 0; q + 3 < water.verts.size(); q += 4) {
+        const MeshVertex& a = water.verts[q];
+        if ((a.attr & 7u) != 2u) continue;  // +Y faces only
+        float x0 = a.x, x1 = a.x, z0 = a.z, z1 = a.z;
+        for (size_t k = 1; k < 4; k++) {
+            const MeshVertex& b = water.verts[q + k];
+            x0 = std::min(x0, b.x); x1 = std::max(x1, b.x);
+            z0 = std::min(z0, b.z); z1 = std::max(z1, b.z);
+        }
+        const int xa = std::max(0, (int)std::floor(x0 + 0.5f) - ox), xb = std::min(World::CS, (int)std::floor(x1 + 0.5f) - ox);
+        const int za = std::max(0, (int)std::floor(z0 + 0.5f) - oz), zb = std::min(World::CS, (int)std::floor(z1 + 0.5f) - oz);
+        const int y = (int)std::floor(a.y + 0.5f) - oy;  // plane height within the chunk
+        if (y < 1 || y > World::CS) continue;
+        for (int z = za; z < zb; z++)
+            for (int x = xa; x < xb; x++) out[x + 32 * z] = std::max<uint8_t>(out[x + 32 * z], (uint8_t)y);
+    }
 }
 
 // Occupancy bricks (8^3 voxels each, 4x4x4 per chunk) used by the shader to skip empty space.

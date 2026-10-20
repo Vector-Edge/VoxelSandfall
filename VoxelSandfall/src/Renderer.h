@@ -50,6 +50,20 @@ public:
     float sunElevation = 0.95f;   // radians above the horizon
     float speedForBob = 0;        // set by the caller (horizontal speed)
     bool showProfiler = false;    // F4
+    // Graphics quality: -1 = automatic (steps up and down so the frame cost stays under targetMs), 0..4 = fixed tier
+    // (0 = lowest: 2 sky rays, 67 % resolution, simple water; 4 = everything). F12 cycles.
+    int quality = 4;              // the full-detail look by default; F12 / --quality auto lets it adapt
+    float targetMs = 9.0f;        // frame cost (CPU work or GPU time, whichever is larger) the automatic mode aims for
+    void setQualityNow(int q) {
+        quality = q;
+        if (q >= 0) setTier(q);
+    }
+    int currentTier() const { return tier_; }
+    float currentScale() const { return renderScale_; }
+    // Debug / screenshot camera that does not move the player (script command `viewcam`).
+    bool camOverride = false;
+    Vec3 camOverridePos;
+    float camOverrideYaw = 0, camOverridePitch = 0;
 
     RenderStats stats;
     std::string adapterName;
@@ -79,6 +93,7 @@ private:
 
     // per-frame
     void updateWorldGpu(Game& g);
+    void updateWaterField(Game& g);
     void updateBodies(Game& g);
     void uploadMesh(GpuMesh& gm, const MeshData& md);
     void uploadDynamic(ComPtr<ID3D11Buffer>& vb, ComPtr<ID3D11Buffer>& ib, UINT& indexCount, UINT& vbCap, UINT& ibCap,
@@ -112,22 +127,25 @@ private:
     std::string shaderDir_;
 
     // shadow + occupancy
-    static constexpr int kShadowSize = 4096;
+    int shadowSize_ = 4096;            // 2048 on the lowest tiers
+    bool createShadowMap(int size);
     ComPtr<ID3D11Texture2D> shadowTex_;
     ComPtr<ID3D11DepthStencilView> shadowDSV_;
     ComPtr<ID3D11ShaderResourceView> shadowSRV_;
     ComPtr<ID3D11Texture3D> occTex_, brickTex_;
     ComPtr<ID3D11ShaderResourceView> occSRV_, brickSRV_;
+    ComPtr<ID3D11Texture2D> waterFieldTex_;           // ripples / foam / surface slope (see WaterField.h)
+    ComPtr<ID3D11ShaderResourceView> waterFieldSRV_;
 
     // shaders
     ComPtr<ID3D11VertexShader> vsShadow_, vsWorld_, vsSky_, vsLine_, vsUI_, vsView_;
-    ComPtr<ID3D11PixelShader> psWorld_, psWater_, psSky_, psLine_, psUI_, psView_, psFlash_;
+    ComPtr<ID3D11PixelShader> psWorld_, psWater_, psUnder_, psBlit_, psSky_, psLine_, psUI_, psView_, psFlash_;
     ComPtr<ID3D11InputLayout> layWorld_, layLine_, layUI_, layView_;
 
     // states
     ComPtr<ID3D11RasterizerState> rsSolid_, rsShadow_, rsNoCull_;
     ComPtr<ID3D11DepthStencilState> dsLess_, dsLessNoWrite_, dsOff_, dsEqual_, dsSky_;
-    ComPtr<ID3D11BlendState> bsOpaque_, bsAlpha_, bsAdd_;
+    ComPtr<ID3D11BlendState> bsOpaque_, bsAlpha_, bsAdd_, bsWater_;
     ComPtr<ID3D11SamplerState> sampShadow_, sampLinear_;
 
     // constant buffers
@@ -159,18 +177,50 @@ private:
     // parallel chunk meshing
     struct ChunkWork {
         int ci = 0;
-        bool mesh = false, tex = false;
+        bool mesh = false, waterOnly = false, tex = false;
         MeshData opaque, water;
         uint8_t bricks[64];
+        uint8_t tops[1024];  // open-water surface heights per column (waterTopsOfMesh)
     };
     std::vector<ChunkWork> work_;
+    std::vector<uint8_t> chunkTops_;     // per chunk: 32x32 water surface heights
+    std::vector<uint16_t> waterTopMap_;  // per world column: highest open-water surface plane (0 = none)
+    bool topsDirty_ = false;
+    int topsX0_ = 1 << 20, topsZ0_ = 1 << 20, topsX1_ = -1, topsZ1_ = -1;  // columns whose water surface changed
+    bool castingParticles_ = false;     // some flying particle is not water (the shadow map must follow it)
+    uint32_t waterMapTick_ = 0;
     bool sceneDirty_ = true;            // something the shadow map shows has changed
     float shadowAz_ = -1, shadowEl_ = -1;
 
-    // GPU timing (3 frames in flight)
-    ComPtr<ID3D11Query> qDisjoint_[3];
-    ComPtr<ID3D11Query> qStamp_[3][5];
-    bool qUsed_[3] = {false, false, false};
+    // GPU timing: the GPU can run several frames behind the CPU, so results are collected from a ring of queries
+    static constexpr int kGpuRing = 8;
+    ComPtr<ID3D11Query> qDisjoint_[kGpuRing];
+    ComPtr<ID3D11Query> qStamp_[kGpuRing][5];
+    bool qUsed_[kGpuRing] = {};
+    bool gpuTiming_ = false;   // this frame carries timestamps
+
+    // quality / render scale
+    struct Tier {
+        int rays;          // sky rays per pixel
+        float scale;       // render resolution relative to the window
+        int water;         // water shader detail 0..2
+        float rayLen;      // sky ray length
+        int raySteps;      // sky ray step limit
+        bool shadow9;      // 9 tap shadow filter (else 4)
+        bool contact;      // contact shadow ray
+    };
+    static const Tier kTiers[5];
+    int tier_ = 4;
+    int userSamples_ = 0;               // the MSAA level the user asked for (the lowest tiers use less)
+    float renderScale_ = 1.0f;
+    int sceneW_ = 0, sceneH_ = 0;      // size the 3D scene is rendered at
+    ComPtr<ID3D11Texture2D> sceneTex_;  // resolved scene when it is upscaled
+    ComPtr<ID3D11ShaderResourceView> sceneSRV_;
+    int qualOver_ = 0, qualUnder_ = 0;  // consecutive frames over / well under the budget
+    double lastTierChange_ = -100, tierBlockedUntil_[5] = {};
+    int qualityFrames_ = 0;
+    void setTier(int t);
+    void updateAutoQuality();
 
     // frame state
     Mat4 view_, proj_, viewProj_, lightViewProj_;

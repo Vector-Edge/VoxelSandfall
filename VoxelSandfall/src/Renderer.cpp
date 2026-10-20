@@ -18,7 +18,7 @@ namespace {
 struct FrameCB {
     Mat4 viewProj, lightViewProj;
     float camPos[4], sunDir[4], sunColor[4], skyZenith[4], skyHorizon[4], groundCol[4];
-    float params[4], gridDims[4], camRight[4], camUp[4], camFwd[4];
+    float params[4], gridDims[4], camRight[4], camUp[4], camFwd[4], qual[4];
 };
 struct ObjectCB {
     Mat4 model;
@@ -187,6 +187,68 @@ bool Renderer::createDevice(HWND hwnd) {
     return true;
 }
 
+const Renderer::Tier Renderer::kTiers[5] = {
+    {2, 0.67f, 0, 28.0f, 32, false, false},
+    {3, 0.78f, 0, 32.0f, 38, false, true},
+    {4, 0.88f, 1, 36.0f, 42, true, true},
+    {6, 1.00f, 1, 44.0f, 52, true, true},
+    {8, 1.00f, 2, 44.0f, 52, true, true},
+};
+
+// Switches to a quality tier; a different render scale means new scene render targets.
+void Renderer::setTier(int t) {
+    t = std::clamp(t, 0, 4);
+    const float oldScale = renderScale_;
+    const int oldSamples = sampleCount_;
+    if (userSamples_ == 0) userSamples_ = sampleCount_;
+    tier_ = t;
+    renderScale_ = kTiers[t].scale;
+    static const int kMsaaCap[5] = {1, 2, 8, 8, 8};  // multisampling is bandwidth the weakest GPUs cannot spare
+    sampleCount_ = std::min(userSamples_, kMsaaCap[t]);
+    lastTierChange_ = prof::nowMs() * 0.001;
+    qualOver_ = qualUnder_ = 0;
+    const int wantShadow = t <= 1 ? 2048 : 4096;  // a quarter of the shadow pixels on the weakest tiers
+    if (wantShadow != shadowSize_ && swap_) {
+        ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+        createShadowMap(wantShadow);
+    }
+    if ((renderScale_ != oldScale || sampleCount_ != oldSamples) && swap_) {
+        ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+        createSizeResources();
+    }
+    logLine("quality tier %d (render scale %.0f %%, %d sky rays, water detail %d)", tier_, renderScale_ * 100.0f, kTiers[t].rays, kTiers[t].water);
+}
+
+// Automatic quality: keeps the cost of a frame (the larger of the CPU work and the GPU time, smoothed) under targetMs.
+// Over budget for a third of a second -> one tier down; comfortably under for several seconds -> one tier up (but not
+// straight back into a tier that has just proved too expensive).
+void Renderer::updateAutoQuality() {
+    if (quality >= 0) {
+        if (quality != tier_) setTier(quality);
+        return;
+    }
+    if (++qualityFrames_ < 90 || firstBuild_) return;
+    double cpu = 0;
+    for (int i = 0; i < prof::P_COUNT; i++)
+        if (i != prof::P_PRESENT) cpu += prof::g_avg[i];
+    const double gpu = prof::g_gpuAvg[prof::G_TOTAL];
+    if (gpu <= 0.0) return;  // no GPU timings on this device: stay where we are
+    const double cost = std::max(cpu, gpu);
+    const double now = prof::nowMs() * 0.001;
+    if (cost > targetMs) {
+        qualUnder_ = 0;
+        if (++qualOver_ >= 20 && tier_ > 0) {
+            if (now - lastTierChange_ < 8.0) tierBlockedUntil_[tier_] = now + 25.0;  // the tier we just stepped up to was too much
+            setTier(tier_ - 1);
+        }
+    } else if (cost < targetMs * 0.62) {
+        qualOver_ = 0;
+        if (++qualUnder_ >= 150 && tier_ < 4 && now - lastTierChange_ > 3.0 && now >= tierBlockedUntil_[tier_ + 1]) setTier(tier_ + 1);
+    } else {
+        qualOver_ = qualUnder_ = 0;
+    }
+}
+
 bool Renderer::createSizeResources() {
     backRTV_.Reset();
     backTex_.Reset();
@@ -194,12 +256,17 @@ bool Renderer::createSizeResources() {
     msaaDepth_.Reset();
     msaaRTV_.Reset();
     msaaDSV_.Reset();
+    sceneTex_.Reset();
+    sceneSRV_.Reset();
     VS_CHECK(swap_->GetBuffer(0, IID_PPV_ARGS(&backTex_)));
     VS_CHECK(dev_->CreateRenderTargetView(backTex_.Get(), nullptr, &backRTV_));
 
+    const bool scaled = renderScale_ < 0.999f;
+    sceneW_ = scaled ? std::max(16, ((int)std::lround(width_ * renderScale_) + 1) & ~1) : width_;
+    sceneH_ = scaled ? std::max(16, ((int)std::lround(height_ * renderScale_) + 1) & ~1) : height_;
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = (UINT)width_;
-    td.Height = (UINT)height_;
+    td.Width = (UINT)sceneW_;
+    td.Height = (UINT)sceneH_;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -212,6 +279,13 @@ bool Renderer::createSizeResources() {
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     VS_CHECK(dev_->CreateTexture2D(&td, nullptr, &msaaDepth_));
     VS_CHECK(dev_->CreateDepthStencilView(msaaDepth_.Get(), nullptr, &msaaDSV_));
+    if (scaled) {  // the resolved scene, which the upscale pass reads
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        VS_CHECK(dev_->CreateTexture2D(&td, nullptr, &sceneTex_));
+        VS_CHECK(dev_->CreateShaderResourceView(sceneTex_.Get(), nullptr, &sceneSRV_));
+    }
     return true;
 }
 
@@ -226,7 +300,10 @@ void Renderer::cycleMsaa() {
         if (cand == 1 || (SUCCEEDED(dev_->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)cand, &q1)) && q1 > 0 &&
                           SUCCEEDED(dev_->CheckMultisampleQualityLevels(DXGI_FORMAT_D32_FLOAT, (UINT)cand, &q2)) && q2 > 0)) {
             ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+            userSamples_ = cand;
             sampleCount_ = cand;
+            if (tier_ == 0) sampleCount_ = 1;
+            else if (tier_ == 1) sampleCount_ = std::min(cand, 2);
             createSizeResources();
             logLine("MSAA now %dx", cand);
             return;
@@ -246,6 +323,8 @@ void Renderer::resize(int width, int height) {
     msaaDepth_.Reset();
     msaaRTV_.Reset();
     msaaDSV_.Reset();
+    sceneTex_.Reset();
+    sceneSRV_.Reset();
     if (FAILED(swap_->ResizeBuffers(0, (UINT)width_, (UINT)height_, DXGI_FORMAT_UNKNOWN, 0))) {
         logLine("ResizeBuffers failed");
         return;
@@ -262,11 +341,15 @@ bool Renderer::createDynamicBuffer(ComPtr<ID3D11Buffer>& buf, UINT bytes, UINT b
     return SUCCEEDED(dev_->CreateBuffer(&bd, nullptr, &buf));
 }
 
-bool Renderer::createStaticResources() {
-    // Shadow map.
+bool Renderer::createShadowMap(int size) {
+    shadowTex_.Reset();
+    shadowDSV_.Reset();
+    shadowSRV_.Reset();
+    shadowSize_ = size;
+    sceneDirty_ = true;  // the map has to be drawn again
     {
         D3D11_TEXTURE2D_DESC td = {};
-        td.Width = td.Height = kShadowSize;
+        td.Width = td.Height = (UINT)size;
         td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R32_TYPELESS;
         td.SampleDesc.Count = 1;
@@ -283,6 +366,11 @@ bool Renderer::createStaticResources() {
         sv.Texture2D.MipLevels = 1;
         VS_CHECK(dev_->CreateShaderResourceView(shadowTex_.Get(), &sv, &shadowSRV_));
     }
+    return true;
+}
+
+bool Renderer::createStaticResources() {
+    if (!createShadowMap(shadowSize_)) return false;
     // World occupancy volume used for ray-traced sky light (same layout as the chunk storage).
     {
         D3D11_TEXTURE3D_DESC td = {};
@@ -300,6 +388,21 @@ bool Renderer::createStaticResources() {
         td.Depth = cfg::WORLD_Z / 8;
         VS_CHECK(dev_->CreateTexture3D(&td, nullptr, &brickTex_));
         VS_CHECK(dev_->CreateShaderResourceView(brickTex_.Get(), nullptr, &brickSRV_));
+    }
+    // Water surface field (ripples, foam, smoothed slope): RGBA16F, one texel per world column.
+    {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = WaterField::W;
+        td.Height = WaterField::D;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        VS_CHECK(dev_->CreateTexture2D(&td, nullptr, &waterFieldTex_));
+        VS_CHECK(dev_->CreateShaderResourceView(waterFieldTex_.Get(), nullptr, &waterFieldSRV_));
+        const std::vector<uint16_t> zero((size_t)WaterField::W * WaterField::D * 4, 0);
+        ctx_->UpdateSubresource(waterFieldTex_.Get(), 0, nullptr, zero.data(), WaterField::W * 8, 0);
     }
     // States.
     {
@@ -347,6 +450,17 @@ bool Renderer::createStaticResources() {
         bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
         bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
         VS_CHECK(dev_->CreateBlendState(&bd, &bsAdd_));
+        // Water: dual-source blend, result = water.add + background * water.mul (per-channel absorption).
+        D3D11_BLEND_DESC wb = {};
+        wb.RenderTarget[0].BlendEnable = TRUE;
+        wb.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        wb.RenderTarget[0].DestBlend = D3D11_BLEND_SRC1_COLOR;
+        wb.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        wb.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        wb.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        wb.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        wb.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        VS_CHECK(dev_->CreateBlendState(&wb, &bsWater_));
 
         D3D11_SAMPLER_DESC sd = {};
         sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
@@ -370,6 +484,8 @@ bool Renderer::createStaticResources() {
     }
     chunkOpaque_.assign((size_t)cfg::WORLD_X / 32 * (cfg::WORLD_Y / 32) * (cfg::WORLD_Z / 32), GpuMesh());
     chunkWater_.assign(chunkOpaque_.size(), GpuMesh());
+    chunkTops_.assign(chunkOpaque_.size() * 1024, 0);
+    waterTopMap_.assign((size_t)WaterField::W * WaterField::D, 0);
     lineCap_ = 8192 * 12;
     uiCap_ = 4096 * sizeof(UIVertex);
     if (!createDynamicBuffer(lineVB_, lineCap_, D3D11_BIND_VERTEX_BUFFER) || !createDynamicBuffer(uiVB_, uiCap_, D3D11_BIND_VERTEX_BUFFER)) {
@@ -395,7 +511,7 @@ bool Renderer::compile(const char* file, const char* entry, const char* target, 
 bool Renderer::createShaders(bool initial) {
     ComPtr<ID3DBlob> b;
     ComPtr<ID3D11VertexShader> vsShadow, vsWorld, vsSky, vsLine, vsUI, vsView;
-    ComPtr<ID3D11PixelShader> psWorld, psWater, psSky, psLine, psUI, psView, psFlash;
+    ComPtr<ID3D11PixelShader> psWorld, psWater, psUnder, psBlit, psSky, psLine, psUI, psView, psFlash;
     ComPtr<ID3D11InputLayout> layWorld, layLine, layUI, layView;
     auto vs = [&](const char* f, const char* e, ComPtr<ID3D11VertexShader>& out, ComPtr<ID3DBlob>* keep = nullptr) {
         ComPtr<ID3DBlob> blob;
@@ -413,7 +529,7 @@ bool Renderer::createShaders(bool initial) {
     bool ok = vs("world.hlsl", "VSShadow", vsShadow) && vs("world.hlsl", "VSWorld", vsWorld, &bWorld) &&
               vs("sky.hlsl", "VSSky", vsSky) && vs("line.hlsl", "VSLine", vsLine, &bLine) && vs("ui.hlsl", "VSUI", vsUI, &bUI) &&
               vs("viewmodel.hlsl", "VSView", vsView, &bView) && ps("world.hlsl", "PSWorld", psWorld) &&
-              ps("world.hlsl", "PSWater", psWater) && ps("sky.hlsl", "PSSky", psSky) && ps("line.hlsl", "PSLine", psLine) &&
+              ps("world.hlsl", "PSWater", psWater) && ps("sky.hlsl", "PSUnderwater", psUnder) && ps("sky.hlsl", "PSBlit", psBlit) && ps("sky.hlsl", "PSSky", psSky) && ps("line.hlsl", "PSLine", psLine) &&
               ps("ui.hlsl", "PSUI", psUI) && ps("viewmodel.hlsl", "PSView", psView) && ps("viewmodel.hlsl", "PSFlash", psFlash);
     if (!ok) return false;
 
@@ -440,7 +556,7 @@ bool Renderer::createShaders(bool initial) {
         return false;
     }
     vsShadow_ = vsShadow; vsWorld_ = vsWorld; vsSky_ = vsSky; vsLine_ = vsLine; vsUI_ = vsUI; vsView_ = vsView;
-    psWorld_ = psWorld; psWater_ = psWater; psSky_ = psSky; psLine_ = psLine; psUI_ = psUI; psView_ = psView; psFlash_ = psFlash;
+    psWorld_ = psWorld; psWater_ = psWater; psUnder_ = psUnder; psBlit_ = psBlit; psSky_ = psSky; psLine_ = psLine; psUI_ = psUI; psView_ = psView; psFlash_ = psFlash;
     layWorld_ = layWorld; layLine_ = layLine; layUI_ = layUI; layView_ = layView;
 
     if (initial) {
@@ -562,24 +678,27 @@ void Renderer::updateWorldGpu(Game& g) {
 
     // Work is done in parallel batches until the frame's world-update budget (~6 ms) is spent; chunks that are
     // still dirty simply wait for the next frame, so even a half-million-voxel pour cannot stall the frame.
-    int rebuilds = 0;
+    int rebuilds = 0, fullRebuilds = 0;
     int cursor = rebuildCursor_;
     int scanned = 0;
-    const double budgetMs = firstBuild_ ? 1e9 : 6.0;
+    const double budgetMs = firstBuild_ ? 1e9 : 3.5;  // small slices: a big edit spreads over a few frames instead of one long hitch
     while (scanned < n && nowMs() - t0 < budgetMs) {
         size_t count = 0;
-        const size_t batch = firstBuild_ ? (size_t)n : 24;
+        const size_t batch = firstBuild_ ? (size_t)n : 8;
         while (scanned < n && count < batch) {
             const int ci = cursor;
             cursor = (cursor + 1) % n;
             scanned++;
-            const bool tex = w.texDirty[ci] != 0, mesh = w.meshDirty[ci] != 0;
-            if (!tex && !mesh) continue;
+            const bool tex = w.texDirty[ci] != 0, mesh = w.meshDirty[ci] != 0, wmesh = !mesh && w.waterDirty[ci] != 0;
+            if (!tex && !mesh && !wmesh) continue;
+            // Chunks where only water moved are refreshed every other frame (30 Hz is plenty for a flowing surface).
+            if (!mesh && ((unsigned)ci + (unsigned)frameIndex_) % 2u) continue;
             if (work_.size() <= count) work_.emplace_back();
             ChunkWork& cw = work_[count++];
             cw.ci = ci;
             cw.tex = tex;
             cw.mesh = mesh;
+            cw.waterOnly = wmesh;
         }
         if (!count) break;
 
@@ -588,7 +707,12 @@ void Renderer::updateWorldGpu(Game& g) {
             auto job = [&](int k, int) {
                 ChunkWork& cw = work_[(size_t)k];
                 if (cw.tex) computeBricks(w, cw.ci, cw.bricks);
-                if (cw.mesh) buildChunkMesh(w, cw.ci % w.CX, (cw.ci / w.CX) % w.CY, cw.ci / (w.CX * w.CY), cw.opaque, cw.water);
+                if (cw.mesh || cw.waterOnly) {
+                    const int cx = cw.ci % w.CX, cy = (cw.ci / w.CX) % w.CY, cz = cw.ci / (w.CX * w.CY);
+                    if (cw.mesh) buildChunkMesh(w, cx, cy, cz, cw.opaque, cw.water);
+                    else buildChunkWaterMesh(w, cx, cy, cz, cw.water);
+                    waterTopsOfMesh(cw.water, cx, cy, cz, cw.tops);
+                }
             };
             if (count < 3) {
                 for (size_t k = 0; k < count; k++) job((int)k, 0);
@@ -607,19 +731,66 @@ void Renderer::updateWorldGpu(Game& g) {
                 ctx_->UpdateSubresource(brickTex_.Get(), 0, &bb, cw.bricks, 4, 16);
                 w.texDirty[cw.ci] = 0;
             }
-            if (cw.mesh) {
-                uploadMesh(chunkOpaque_[cw.ci], cw.opaque);
+            if (cw.mesh || cw.waterOnly) {
+                if (cw.mesh) uploadMesh(chunkOpaque_[cw.ci], cw.opaque);
                 uploadMesh(chunkWater_[cw.ci], cw.water);
-                w.meshDirty[cw.ci] = 0;
+                uint8_t* tops = &chunkTops_[(size_t)cw.ci * 1024];
+                if (std::memcmp(tops, cw.tops, 1024) != 0) {
+                    std::memcpy(tops, cw.tops, 1024);
+                    topsDirty_ = true;
+                    topsX0_ = std::min(topsX0_, cx * 32);
+                    topsZ0_ = std::min(topsZ0_, cz * 32);
+                    topsX1_ = std::max(topsX1_, cx * 32 + 31);
+                    topsZ1_ = std::max(topsZ1_, cz * 32 + 31);
+                }
+                if (cw.mesh) {
+                    w.meshDirty[cw.ci] = 0;
+                    fullRebuilds++;
+                }
+                w.waterDirty[cw.ci] = 0;
                 rebuilds++;
             }
         }
     }
     rebuildCursor_ = cursor;
-    if (rebuilds) sceneDirty_ = true;
+    if (fullRebuilds) sceneDirty_ = true;  // water is not in the shadow map: water-only rebuilds leave it alone
     firstBuild_ = false;
     stats.chunkRebuilds = rebuilds;
     stats.meshMs = nowMs() - t0;
+}
+
+// Combines the per-chunk water surface maps into one per-column map for the WaterField (a few times per second at most
+// while the water is changing; only the chunk columns that changed) and uploads the changed part of the field's texture.
+void Renderer::updateWaterField(Game& g) {
+    prof::Scope sc(prof::P_UPLOAD);
+    if (topsDirty_ && (++waterMapTick_ % 3) == 0) {
+        topsDirty_ = false;
+        const World& w = g.world;
+        constexpr int N = World::CS;
+        const int rx0 = topsX0_, rz0 = topsZ0_, rx1 = topsX1_, rz1 = topsZ1_;
+        topsX0_ = topsZ0_ = 1 << 20;
+        topsX1_ = topsZ1_ = -1;
+        for (int cz = rz0 / N; cz <= rz1 / N; cz++)
+            for (int cx = rx0 / N; cx <= rx1 / N; cx++)
+                for (int lz = 0; lz < N; lz++) {
+                    uint16_t* out = &waterTopMap_[(size_t)(cz * N + lz) * WaterField::W + (size_t)cx * N];
+                    for (int lx = 0; lx < N; lx++) {
+                        uint16_t top = 0;
+                        for (int cy = w.CY - 1; cy >= 0 && !top; cy--) {
+                            const uint8_t t = chunkTops_[(size_t)w.chunkIndex(cx, cy, cz) * 1024 + (size_t)(lx + N * lz)];
+                            if (t) top = (uint16_t)(cy * N + t);
+                        }
+                        out[lx] = top;
+                    }
+                }
+        g.waterField.setSurface(waterTopMap_.data(), rx0, rz0, rx1, rz1);
+    }
+    int x0, z0, x1, z1;
+    if (g.waterField.consumeDirty(x0, z0, x1, z1)) {
+        const D3D11_BOX box = {(UINT)x0, (UINT)z0, 0, (UINT)x1 + 1, (UINT)z1 + 1, 1};
+        const uint16_t* src = g.waterField.texels() + ((size_t)z0 * WaterField::W + (size_t)x0) * 4;
+        ctx_->UpdateSubresource(waterFieldTex_.Get(), 0, &box, src, WaterField::W * 8, 0);
+    }
 }
 
 void Renderer::updateBodies(Game& g) {
@@ -737,6 +908,8 @@ void Renderer::drawBrush(const Game& g) {
             case M_SAND: col[0] = 0.98f; col[1] = 0.82f; col[2] = 0.42f; break;
             case M_WATER: col[0] = 0.35f; col[1] = 0.65f; col[2] = 1.0f; break;
             case M_STONE: col[0] = 0.92f; col[1] = 0.92f; col[2] = 0.96f; break;
+            case M_DIRT: col[0] = 0.62f; col[1] = 0.42f; col[2] = 0.24f; break;
+            case M_GRASS: col[0] = 0.35f; col[1] = 0.85f; col[2] = 0.25f; break;
             default: col[0] = 0.72f; col[1] = 0.45f; col[2] = 1.0f; break;
         }
     }
@@ -845,7 +1018,7 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
     hud.push_back(b);
     if (g.tool == TOOL_CREATOR) {
         hud.push_back("TOOL      [R] CREATOR  -  place / attach voxels");
-        snprintf(b, sizeof(b), "MATERIAL  %s   (1 sand  2 water  3 stone  4 permanent)", materialName(g.currentMaterial()));
+        snprintf(b, sizeof(b), "MATERIAL  %s   (1 sand  2 water  3 stone  4 permanent  5 dirt  6 grass)", materialName(g.currentMaterial()));
         hud.push_back(b);
     } else {
         hud.push_back("TOOL      [F] GUN  -  carve voxels, split islands");
@@ -854,10 +1027,10 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
     snprintf(b, sizeof(b), "BRUSH     radius %d   (mouse wheel)", g.brush);
     hud.push_back(b);
     size_t awake = g.physics.awakeCount();
-    snprintf(b, sizeof(b), "BODIES    %zu (%zu awake)   SAND %lld   WATER %lld", g.physics.bodies.size(), awake, g.world.counts[M_SAND],
-             g.world.counts[M_WATER]);
+    snprintf(b, sizeof(b), "BODIES    %zu (%zu awake)   SAND %lld  WATER %lld  DIRT %lld  GRASS %lld", g.physics.bodies.size(), awake, g.world.counts[M_SAND],
+             g.world.counts[M_WATER], g.world.counts[M_DIRT], g.world.counts[M_GRASS]);
     hud.push_back(b);
-    snprintf(b, sizeof(b), "RENDER    sky rays %d   chunks %d   meshing %.1f ms", skyRays, stats.chunksDrawn, stats.meshMs);
+    snprintf(b, sizeof(b), "RENDER    quality %s tier %d (%.0f%% res, %d rays, water %d)   chunks %d   meshing %.1f ms", quality < 0 ? "auto" : "fixed", tier_, renderScale_ * 100.0f, kTiers[tier_].rays, kTiers[tier_].water, stats.chunksDrawn, stats.meshMs);
     hud.push_back(b);
 
     if (showProfiler) {
@@ -879,7 +1052,7 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
         help.push_back("WASD move   SPACE jump   SHIFT sprint   MOUSE look   ESC release mouse");
         help.push_back("R creator   F gun   1-4 or Q/E material   WHEEL brush size   LMB paint / fire");
         help.push_back("[ ] sun azimuth   ; ' sun height   F1 help   F2 screenshot   F3 HUD");
-        help.push_back("F4 profiler   F5 reset world   F6 sky rays   F7 vsync   F8 MSAA   F9 reload shaders");
+        help.push_back("F4 profiler   F5 reset world   F6 sky rays   F7 vsync   F8 MSAA   F9 reload shaders   F12 quality (auto / 0-4)");
     }
 }
 
@@ -966,11 +1139,11 @@ void Renderer::drawHud(const Game& g) {
     }
     // Material swatches (Creator).
     if (g.tool == TOOL_CREATOR) {
-        const float sw = 46, gapx = 10, total = 4 * sw + 3 * gapx;
+        const float sw = 46, gapx = 10, total = (float)kPaintMaterialCount * sw + (float)(kPaintMaterialCount - 1) * gapx;
         const float x0 = W * 0.5f - total * 0.5f, y0 = H - 78;
-        const uint32_t cols[4] = {packColor(0.87f, 0.71f, 0.40f, 1), packColor(0.18f, 0.47f, 0.84f, 1), packColor(0.58f, 0.58f, 0.62f, 1),
-                                  packColor(0.28f, 0.22f, 0.45f, 1)};
-        for (int i = 0; i < 4; i++) {
+        const uint32_t cols[kPaintMaterialCount] = {packColor(0.87f, 0.71f, 0.40f, 1), packColor(0.18f, 0.47f, 0.84f, 1), packColor(0.58f, 0.58f, 0.62f, 1),
+                                                    packColor(0.28f, 0.22f, 0.45f, 1), packColor(0.45f, 0.30f, 0.17f, 1), packColor(0.25f, 0.62f, 0.18f, 1)};
+        for (int i = 0; i < kPaintMaterialCount; i++) {
             const float x = x0 + (float)i * (sw + gapx);
             const bool sel = (i == g.materialIndex);
             const float pad = sel ? 4.0f : 2.0f;
@@ -1036,31 +1209,32 @@ void Renderer::saveScreenshot(const std::string& path) {
 // GPU timestamps
 // ------------------------------------------------------------------------------------------------
 void Renderer::gpuBegin() {
-    const int s = (int)(frameIndex_ % 3);
+    const int s = (int)(frameIndex_ % kGpuRing);
+    // Collect whatever has finished (non-blocking); the slot of this frame is only reused once its old data was read.
+    for (int r = 0; r < kGpuRing; r++) {
+        if (!qUsed_[r] || r == s) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        if (ctx_->GetData(qDisjoint_[r].Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+        UINT64 t[5];
+        bool ok = !dj.Disjoint;
+        for (int i = 0; i < 5 && ok; i++) ok = ctx_->GetData(qStamp_[r][i].Get(), &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        if (ok) {
+            const double k = 1000.0 / (double)dj.Frequency;
+            prof::setGpu(prof::G_SHADOW, (double)(t[1] - t[0]) * k);
+            prof::setGpu(prof::G_MAIN, (double)(t[2] - t[1]) * k);
+            prof::setGpu(prof::G_WATER, (double)(t[3] - t[2]) * k);
+            prof::setGpu(prof::G_POST, (double)(t[4] - t[3]) * k);
+            prof::setGpu(prof::G_TOTAL, (double)(t[4] - t[0]) * k);
+        }
+        qUsed_[r] = false;
+    }
+    gpuTiming_ = !qUsed_[s];
+    if (!gpuTiming_) return;
     if (!qDisjoint_[s]) {
         D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
         dev_->CreateQuery(&qd, &qDisjoint_[s]);
         qd.Query = D3D11_QUERY_TIMESTAMP;
         for (int i = 0; i < 5; i++) dev_->CreateQuery(&qd, &qStamp_[s][i]);
-    }
-    // Read back the frame that was submitted two frames ago (non-blocking).
-    const int r = (int)((frameIndex_ + 1) % 3);
-    if (qUsed_[r] && qDisjoint_[r]) {
-        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-        if (ctx_->GetData(qDisjoint_[r].Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
-            UINT64 t[5];
-            bool ok = !dj.Disjoint;
-            for (int i = 0; i < 5 && ok; i++) ok = ctx_->GetData(qStamp_[r][i].Get(), &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
-            if (ok) {
-                const double k = 1000.0 / (double)dj.Frequency;
-                prof::setGpu(prof::G_SHADOW, (double)(t[1] - t[0]) * k);
-                prof::setGpu(prof::G_MAIN, (double)(t[2] - t[1]) * k);
-                prof::setGpu(prof::G_WATER, (double)(t[3] - t[2]) * k);
-                prof::setGpu(prof::G_POST, (double)(t[4] - t[3]) * k);
-                prof::setGpu(prof::G_TOTAL, (double)(t[4] - t[0]) * k);
-            }
-            qUsed_[r] = false;
-        }
     }
     if (qDisjoint_[s]) {
         ctx_->Begin(qDisjoint_[s].Get());
@@ -1069,13 +1243,13 @@ void Renderer::gpuBegin() {
 }
 
 void Renderer::gpuStamp(int i) {
-    const int s = (int)(frameIndex_ % 3);
-    if (qStamp_[s][i]) ctx_->End(qStamp_[s][i].Get());
+    const int s = (int)(frameIndex_ % kGpuRing);
+    if (gpuTiming_ && qStamp_[s][i]) ctx_->End(qStamp_[s][i].Get());
 }
 
 void Renderer::gpuEnd() {
-    const int s = (int)(frameIndex_ % 3);
-    if (qDisjoint_[s]) {
+    const int s = (int)(frameIndex_ % kGpuRing);
+    if (gpuTiming_ && qDisjoint_[s]) {
         ctx_->End(qStamp_[s][4].Get());
         ctx_->End(qDisjoint_[s].Get());
         qUsed_[s] = true;
@@ -1100,11 +1274,16 @@ void Renderer::render(Game& g, float dt) {
     bobTime_ += dt * (5.0f + 7.0f * clampf(speedForBob / cfg::SPRINT_SPEED, 0, 1));
 
     updateWorldGpu(g);
+    updateWaterField(g);
     updateBodies(g);
     {
         static MeshData pm;
         pm.clear();
-        for (const Particle& p : g.particles) appendCube(pm, p.pos, p.size, p.mat);
+        castingParticles_ = false;
+        for (const Particle& p : g.particles) {
+            appendCube(pm, p.pos, p.size, p.mat);
+            castingParticles_ |= p.mat != M_WATER;  // water droplets cast no shadow
+        }
         uploadDynamic(partVB_, partIB_, partIndexCount_, partVBCap_, partIBCap_, pm);
     }
 
@@ -1112,6 +1291,12 @@ void Renderer::render(Game& g, float dt) {
     eye_ = g.player.eye();
     camFwd_ = g.player.forwardDir();
     camRight_ = g.player.rightDir();
+    if (camOverride) {
+        eye_ = camOverridePos;
+        const float cp = std::cos(camOverridePitch);
+        camFwd_ = Vec3(-std::sin(camOverrideYaw) * cp, std::sin(camOverridePitch), -std::cos(camOverrideYaw) * cp);
+        camRight_ = Vec3(std::cos(camOverrideYaw), 0, -std::sin(camOverrideYaw));
+    }
     camUp_ = normalize(cross(camRight_, camFwd_));
     const float aspect = (float)width_ / (float)height_;
     view_ = Mat4::lookAt(eye_, eye_ + camFwd_, Vec3(0, 1, 0));
@@ -1149,7 +1334,9 @@ void Renderer::render(Game& g, float dt) {
     set4(fc.skyZenith, 0.30f, 0.41f, 0.64f, 1);
     set4(fc.skyHorizon, 0.56f, 0.64f, 0.80f, 1);
     set4(fc.groundCol, 0.22f, 0.19f, 0.16f, 1);
-    set4(fc.params, 1.0f / (float)kShadowSize, (float)skyRays, 44.0f, 52.0f);
+    const Tier& tr = kTiers[std::clamp(tier_, 0, 4)];
+    set4(fc.params, 1.0f / (float)shadowSize_, (float)(skyRays > 0 ? std::min(skyRays, tr.rays) : 0), tr.rayLen, (float)tr.raySteps);
+    set4(fc.qual, (float)tr.water, tr.shadow9 ? 1.0f : 0.0f, tr.contact ? 1.0f : 0.0f, tr.rays <= 4 ? 1.0f : 0.0f);
     set4(fc.gridDims, (float)cfg::WORLD_X, (float)cfg::WORLD_Y, (float)cfg::WORLD_Z, 0);
     set4(fc.camRight, camRight_.x, camRight_.y, camRight_.z, aspect);
     set4(fc.camUp, camUp_.x, camUp_.y, camUp_.z, std::tan(fovY_ * 0.5f));
@@ -1163,21 +1350,21 @@ void Renderer::render(Game& g, float dt) {
     ID3D11Buffer* cbs[2] = {cbFrame_.Get(), cbObject_.Get()};
     ctx_->VSSetConstantBuffers(0, 2, cbs);
     ctx_->PSSetConstantBuffers(0, 2, cbs);
-    ID3D11ShaderResourceView* nullSrv[3] = {nullptr, nullptr, nullptr};
-    ctx_->PSSetShaderResources(0, 3, nullSrv);
+    ID3D11ShaderResourceView* nullSrv[4] = {nullptr, nullptr, nullptr, nullptr};
+    ctx_->PSSetShaderResources(0, 4, nullSrv);
 
     // --- 1. sun shadow map (re-rendered only when something it shows has changed) ---------------------
     const double tDraw0 = prof::nowMs();
     gpuBegin();
     const bool sunMoved = std::fabs(sunAzimuth - shadowAz_) > 1e-4f || std::fabs(sunElevation - shadowEl_) > 1e-4f;
-    const bool needShadow = sceneDirty_ || sunMoved || g.physics.awakeCount() > 0 || !g.particles.empty();
+    const bool needShadow = sceneDirty_ || sunMoved || g.physics.awakeCount() > 0 || castingParticles_;
     if (needShadow) {
         shadowAz_ = sunAzimuth;
         shadowEl_ = sunElevation;
         sceneDirty_ = false;
         ctx_->OMSetRenderTargets(0, nullptr, shadowDSV_.Get());
         ctx_->ClearDepthStencilView(shadowDSV_.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
-        D3D11_VIEWPORT svp = {0, 0, (float)kShadowSize, (float)kShadowSize, 0, 1};
+        D3D11_VIEWPORT svp = {0, 0, (float)shadowSize_, (float)shadowSize_, 0, 1};
         ctx_->RSSetViewports(1, &svp);
         ctx_->RSSetState(rsShadow_.Get());
         ctx_->OMSetDepthStencilState(dsLess_.Get(), 0);
@@ -1193,16 +1380,17 @@ void Renderer::render(Game& g, float dt) {
     gpuStamp(1);
 
     // --- 2. main pass (MSAA): depth pre-pass, then shade each visible pixel exactly once --------------
-    D3D11_VIEWPORT vp = {0, 0, (float)width_, (float)height_, 0, 1};
+    D3D11_VIEWPORT vp = {0, 0, (float)sceneW_, (float)sceneH_, 0, 1};
     ctx_->RSSetViewports(1, &vp);
     ctx_->OMSetRenderTargets(1, msaaRTV_.GetAddressOf(), msaaDSV_.Get());
     const float clear[4] = {0, 0, 0, 1};
     ctx_->ClearRenderTargetView(msaaRTV_.Get(), clear);
     ctx_->ClearDepthStencilView(msaaDSV_.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
-    ID3D11ShaderResourceView* srvs[3] = {shadowSRV_.Get(), occSRV_.Get(), brickSRV_.Get()};
-    ctx_->PSSetShaderResources(0, 3, srvs);
-    ctx_->PSSetSamplers(0, 1, sampShadow_.GetAddressOf());
+    ID3D11ShaderResourceView* srvs[4] = {shadowSRV_.Get(), occSRV_.Get(), brickSRV_.Get(), waterFieldSRV_.Get()};
+    ctx_->PSSetShaderResources(0, 4, srvs);
+    ID3D11SamplerState* samps[2] = {sampShadow_.Get(), sampLinear_.Get()};
+    ctx_->PSSetSamplers(0, 2, samps);
     ctx_->RSSetState(rsSolid_.Get());
     ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
     ctx_->IASetInputLayout(layWorld_.Get());
@@ -1226,11 +1414,27 @@ void Renderer::render(Game& g, float dt) {
 
     gpuStamp(2);
     ctx_->PSSetShader(psWater_.Get(), nullptr, 0);
-    ctx_->OMSetBlendState(bsAlpha_.Get(), nullptr, 0xFFFFFFFF);
+    ctx_->OMSetBlendState(bsWater_.Get(), nullptr, 0xFFFFFFFF);
     ctx_->OMSetDepthStencilState(dsLessNoWrite_.Get(), 0);
     setObject(Mat4::identity(), 1, 1, 1, 1);
     drawChunks(true, &fr);
     ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+
+    // Camera under water: tint the whole view (the water surface itself is not drawn from below).
+    if (g.world.get(floorToInt(eye_.x), floorToInt(eye_.y), floorToInt(eye_.z)) == M_WATER) {
+        ctx_->IASetInputLayout(nullptr);
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx_->VSSetShader(vsSky_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psUnder_.Get(), nullptr, 0);
+        ctx_->OMSetBlendState(bsAlpha_.Get(), nullptr, 0xFFFFFFFF);
+        ctx_->OMSetDepthStencilState(dsOff_.Get(), 0);
+        ctx_->RSSetState(rsNoCull_.Get());
+        ctx_->Draw(3, 0);
+        ctx_->RSSetState(rsSolid_.Get());
+        ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+        ctx_->IASetInputLayout(layWorld_.Get());
+        ctx_->VSSetShader(vsWorld_.Get(), nullptr, 0);
+    }
 
     drawBrush(g);
     drawViewModel(g);
@@ -1238,12 +1442,30 @@ void Renderer::render(Game& g, float dt) {
 
     // --- 3. resolve + HUD ---------------------------------------------------------------------------
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
-    ctx_->PSSetShaderResources(0, 3, nullSrv);
+    ctx_->PSSetShaderResources(0, 4, nullSrv);
+    ID3D11Texture2D* resolveDst = sceneTex_ ? sceneTex_.Get() : backTex_.Get();
     if (sampleCount_ > 1)
-        ctx_->ResolveSubresource(backTex_.Get(), 0, msaaColor_.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+        ctx_->ResolveSubresource(resolveDst, 0, msaaColor_.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
     else
-        ctx_->CopyResource(backTex_.Get(), msaaColor_.Get());
+        ctx_->CopyResource(resolveDst, msaaColor_.Get());
     ctx_->OMSetRenderTargets(1, backRTV_.GetAddressOf(), nullptr);
+    D3D11_VIEWPORT fullVp = {0, 0, (float)width_, (float)height_, 0, 1};
+    ctx_->RSSetViewports(1, &fullVp);
+    if (sceneTex_) {  // the scene was rendered below window resolution: upscale it
+        ctx_->IASetInputLayout(nullptr);
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx_->VSSetShader(vsSky_.Get(), nullptr, 0);
+        ctx_->PSSetShader(psBlit_.Get(), nullptr, 0);
+        ctx_->OMSetDepthStencilState(dsOff_.Get(), 0);
+        ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+        ctx_->RSSetState(rsNoCull_.Get());
+        ID3D11ShaderResourceView* blitSrv = sceneSRV_.Get();
+        ctx_->PSSetShaderResources(4, 1, &blitSrv);
+        ctx_->Draw(3, 0);
+        ID3D11ShaderResourceView* noSrv = nullptr;
+        ctx_->PSSetShaderResources(4, 1, &noSrv);
+        ctx_->RSSetState(rsSolid_.Get());
+    }
     if (showHud) drawHud(g);
     gpuEnd();
     prof::g_cur[prof::P_DRAW] += prof::nowMs() - tDraw0;
@@ -1258,4 +1480,5 @@ void Renderer::render(Game& g, float dt) {
     }
     stats.frameMs = nowMs() - tFrame;
     prof::endFrame();
+    updateAutoQuality();
 }

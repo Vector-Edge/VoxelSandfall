@@ -8,6 +8,9 @@ World::World() {
     overlay.assign(total, 0);
     meshDirty.assign(chunkCount(), 1);
     texDirty.assign(chunkCount(), 1);
+    waterDirty.assign(chunkCount(), 0);
+    brickSolid.assign((size_t)chunkCount() * 64, 0);
+    summaryDirty.assign(chunkCount(), 1);
     counts[0] = (long long)total;
     tileCur.resize((size_t)TX * TZ);
     tileNext.resize((size_t)TX * TZ);
@@ -17,19 +20,24 @@ World::World() {
 }
 
 void World::markAllDirty() {
+    std::fill(summaryDirty.begin(), summaryDirty.end(), (uint8_t)1);
     std::fill(meshDirty.begin(), meshDirty.end(), (uint8_t)1);
     std::fill(texDirty.begin(), texDirty.end(), (uint8_t)1);
 }
 
-void World::markDirty(int x, int y, int z) {
+void World::markDirty(int x, int y, int z) { markDirtyImpl(x, y, z, meshDirty); }
+void World::markDirtyWater(int x, int y, int z) { markDirtyImpl(x, y, z, waterDirty); }
+
+void World::markDirtyImpl(int x, int y, int z, std::vector<uint8_t>& meshFlags) {
     int lx = x & 31, ly = y & 31, lz = z & 31;
     int cx = x >> 5, cy = y >> 5, cz = z >> 5;
     // Flags are tested before they are written: the sim threads hit the same few chunks constantly and
     // unconditional stores would bounce those cache lines between cores.
     const int own = chunkIndex(cx, cy, cz);
+    if (&meshFlags == &meshDirty && !summaryDirty[own]) summaryDirty[own] = 1;  // solids may have changed (not for water <-> air)
     if (!texDirty[own]) texDirty[own] = 1;
     if ((unsigned)(lx - 1) < 30u && (unsigned)(ly - 1) < 30u && (unsigned)(lz - 1) < 30u) {  // interior: own chunk only
-        if (!meshDirty[own]) meshDirty[own] = 1;
+        if (!meshFlags[own]) meshFlags[own] = 1;
         return;
     }
     int xa = lx == 0 ? -1 : 0, xb = lx == 31 ? 1 : 0;
@@ -41,8 +49,42 @@ void World::markDirty(int x, int y, int z) {
                 int ax = cx + dx, ay = cy + dy, az = cz + dz;
                 if (ax < 0 || ay < 0 || az < 0 || ax >= CX || ay >= CY || az >= CZ) continue;
                 const int ni = chunkIndex(ax, ay, az);
-                if (!meshDirty[ni]) meshDirty[ni] = 1;
+                if (!meshFlags[ni]) meshFlags[ni] = 1;
             }
+}
+
+bool World::anySolidIn(int x0, int y0, int z0, int x1, int y1, int z1) const {
+    if (y0 < 0) return true;  // the ground
+    x0 = std::max(x0, 0); z0 = std::max(z0, 0);
+    x1 = std::min(x1, SX - 1); z1 = std::min(z1, SZ - 1);
+    y1 = std::min(y1, SY - 1);
+    if (x0 > x1 || y0 > y1 || z0 > z1) return false;
+    for (int bz = z0 >> 3; bz <= (z1 >> 3); bz++)
+        for (int by = y0 >> 3; by <= (y1 >> 3); by++)
+            for (int bx = x0 >> 3; bx <= (x1 >> 3); bx++) {
+                const int ci = chunkIndex(bx >> 2, by >> 2, bz >> 2);
+                uint8_t* flags = &brickSolid[(size_t)ci * 64];
+                if (summaryDirty[ci]) {
+                    const uint8_t* c = chunkData(ci);
+                    std::fill(flags, flags + 64, (uint8_t)0);
+                    for (int z = 0; z < 32; z++)
+                        for (int y = 0; y < 32; y++) {
+                            const uint8_t* row = c + (z << 10) + (y << 5);
+                            uint8_t* f = flags + ((y >> 3) << 2) + ((z >> 3) << 4);
+                            for (int b = 0; b < 4; b++) {
+                                uint8_t any = 0;
+                                for (int x = 0; x < 8; x++) {
+                                    const uint8_t m = row[b * 8 + x] & VOX_MASK;
+                                    any |= (m == M_SAND || m >= M_STONE);
+                                }
+                                f[b] |= any;
+                            }
+                        }
+                    summaryDirty[ci] = 0;
+                }
+                if (flags[(bx & 3) + 4 * (by & 3) + 16 * (bz & 3)]) return true;
+            }
+    return false;
 }
 
 void World::queueCell(int x, int y, int z) {
@@ -69,7 +111,8 @@ void World::set(int x, int y, int z, uint8_t m) {
     data[i] = m;
     counts[old]--;
     counts[m]++;
-    markDirty(x, y, z);
+    if ((old == M_WATER && m == M_AIR) || (old == M_AIR && m == M_WATER)) markDirtyWater(x, y, z);
+    else markDirty(x, y, z);
     wakeAround(x, y, z);
 }
 
@@ -89,14 +132,15 @@ void World::setRaw(int x, int y, int z, uint8_t m) {
     counts[m]++;
 }
 
-void World::notifyBox(int x0, int y0, int z0, int x1, int y1, int z1) {
+void World::notifyBox(int x0, int y0, int z0, int x1, int y1, int z1, bool waterOnly) {
     x0 = std::max(x0 - 1, 0); y0 = std::max(y0 - 1, 0); z0 = std::max(z0 - 1, 0);
     x1 = std::min(x1 + 1, SX - 1); y1 = std::min(y1 + 1, SY - 1); z1 = std::min(z1 + 1, SZ - 1);
     for (int cz = z0 >> 5; cz <= (z1 >> 5); cz++)
         for (int cy = y0 >> 5; cy <= (y1 >> 5); cy++)
             for (int cx = x0 >> 5; cx <= (x1 >> 5); cx++) {
                 int ci = chunkIndex(cx, cy, cz);
-                meshDirty[ci] = 1;
+                (waterOnly ? waterDirty : meshDirty)[ci] = 1;
+                if (!waterOnly) summaryDirty[ci] = 1;
                 texDirty[ci] = 1;
             }
     // Wake every cellular voxel in (and one cell around) the box. Rows are contiguous in x inside a chunk,
@@ -109,12 +153,51 @@ void World::notifyBox(int x0, int y0, int z0, int x1, int y1, int z1) {
             }
 }
 
+void World::notifyBoxWater(int x0, int y0, int z0, int x1, int y1, int z1) {
+    const int ax0 = std::max(x0 - 1, 0), ay0 = std::max(y0 - 1, 0), az0 = std::max(z0 - 1, 0);
+    const int ax1 = std::min(x1 + 1, SX - 1), ay1 = std::min(y1 + 1, SY - 1), az1 = std::min(z1 + 1, SZ - 1);
+    for (int cz = az0 >> 5; cz <= (az1 >> 5); cz++)
+        for (int cy = ay0 >> 5; cy <= (ay1 >> 5); cy++)
+            for (int cx = ax0 >> 5; cx <= (ax1 >> 5); cx++) {
+                const int ci = chunkIndex(cx, cy, cz);
+                waterDirty[ci] = 1;
+                texDirty[ci] = 1;
+            }
+    // the shell just outside the box
+    for (int z = az0; z <= az1; z++)
+        for (int y = ay0; y <= ay1; y++) {
+            const bool zEdge = z == az0 || z == az1, yEdge = y == ay0 || y == ay1;
+            if (zEdge || yEdge) {
+                for (int x = ax0; x <= ax1; x++) queueCell(x, y, z);
+            } else {
+                queueCell(ax0, y, z);
+                queueCell(ax1, y, z);
+            }
+        }
+}
+
+void World::setWaterQuiet(int x, int y, int z) {
+    if (!inBounds(x, y, z)) return;
+    const size_t i = idx(x, y, z);
+    if ((data[i] & VOX_MASK) != M_AIR) return;
+    data[i] = M_WATER;
+    counts[M_AIR]--;
+    counts[M_WATER]++;
+    markDirtyWater(x, y, z);
+    queueCell(x, y - 1, z);
+    if (((++quietCounter) & 7u) == 0) queueCell(x, y, z);
+}
+
 void World::generateArena() {
     std::fill(data.begin(), data.end(), (uint8_t)0);
     std::fill(overlay.begin(), overlay.end(), (uint8_t)0);
     overlayActive = false;
     for (auto& t : tileCur) t.v.clear();
     for (auto& t : tileNext) t.v.clear();
+    dirtQueue.clear();
+    dirtHead = 0;
+    grassActive.clear();
+    grassCursor = 0;
     auto put = [&](int x, int y, int z, uint8_t m) { data[idx(x, y, z)] = m; };
 
     // 256 x 256 x 1 Permanent Stone (bedrock) floor.

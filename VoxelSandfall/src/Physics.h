@@ -29,6 +29,9 @@ struct Body {
     uint32_t version = 1;            // bumped whenever the voxel set changes (mesh rebuild)
     std::vector<uint32_t> ovCells;   // world overlay cells currently marked by this body
     bool ovDirty = true;
+    Vec3 ovPos;                      // pose the overlay was last rasterised at
+    Quat ovRot;
+    bool ovValid = false;
 
     bool occupiedAt(int i, int j, int k) const {
         return (unsigned)i < (unsigned)nx && (unsigned)j < (unsigned)ny && (unsigned)k < (unsigned)nz &&

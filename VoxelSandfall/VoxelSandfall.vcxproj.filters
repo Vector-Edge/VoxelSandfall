@@ -21,6 +21,9 @@
     <ClCompile Include="src\Tools.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Player.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Game.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\SandFx.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\Dirt.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\WaterField.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\SelfTest.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\main.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Mesher.cpp"><Filter>Rendering</Filter></ClCompile>
@@ -38,6 +41,7 @@
     <ClInclude Include="src\Game.h"><Filter>Game</Filter></ClInclude>
     <ClInclude Include="src\Log.h"><Filter>Game</Filter></ClInclude>
     <ClInclude Include="src\Parallel.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\WaterField.h"><Filter>Game</Filter></ClInclude>
     <ClInclude Include="src\Profile.h"><Filter>Game</Filter></ClInclude>
     <ClInclude Include="src\Mesher.h"><Filter>Rendering</Filter></ClInclude>
     <ClInclude Include="src\Renderer.h"><Filter>Rendering</Filter></ClInclude>

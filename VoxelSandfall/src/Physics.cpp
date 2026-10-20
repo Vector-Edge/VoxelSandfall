@@ -224,6 +224,14 @@ void Physics::rasterizeOverlay() {
     for (auto& up : bodies) {
         Body& b = *up;
         if (b.asleep && !b.ovDirty) continue;
+        // A body that has hardly moved since the last time keeps its overlay (the footprint would be the same to within
+        // a fraction of a voxel): resting rubble and big stacks do not pay for re-marking every frame.
+        if (!b.ovDirty && b.ovValid && lengthSq(b.pos - b.ovPos) < 0.04f &&
+            std::fabs(b.rot.w * b.ovRot.w + b.rot.x * b.ovRot.x + b.rot.y * b.ovRot.y + b.rot.z * b.ovRot.z) > 0.999995f)
+            continue;
+        b.ovPos = b.pos;
+        b.ovRot = b.rot;
+        b.ovValid = true;
         clearOverlay(b);
         const Mat3 R = b.rot.toMat3();
         for (int k = 0; k < b.nz; k++)
@@ -259,12 +267,18 @@ void Physics::collideWorld(Body& a, std::vector<Contact>& out) {
     a.warm.assign(a.surf.size(), Vec3(0, 0, 0));
     const bool haveWarm = a.warmPrev.size() == a.surf.size();
     const World& w = world;
+    // A body in mid air touches nothing: one coarse test over its bounding box replaces thousands of voxel lookups.
+    const float br = a.radius + 1.0f;
+    if (!w.anySolidIn(floorToInt(a.pos.x - br), floorToInt(a.pos.y - br), floorToInt(a.pos.z - br), floorToInt(a.pos.x + br),
+                      floorToInt(a.pos.y + br), floorToInt(a.pos.z + br)))
+        return;
 
     for (size_t si = 0; si < a.surf.size(); si++) {
         const Vec3 p = a.pos + R * a.surf[si];
         const int x0 = floorToInt(p.x - kSphereR), x1 = floorToInt(p.x + kSphereR);
         const int y0 = floorToInt(p.y - kSphereR), y1 = floorToInt(p.y + kSphereR);
         const int z0 = floorToInt(p.z - kSphereR), z1 = floorToInt(p.z + kSphereR);
+        if (!w.anySolidIn(x0, y0, z0, x1, y1, z1)) continue;  // nothing solid within reach of this voxel
         float bestDepth = 0;
         Vec3 bestN, bestP;
         for (int z = z0; z <= z1; z++)

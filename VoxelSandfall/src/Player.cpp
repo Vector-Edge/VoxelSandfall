@@ -32,6 +32,21 @@ bool Player::overlapsSolid(const World& w) const {
     return false;
 }
 
+// Fraction of the body (8 heights between the feet and the head) that has water around it. The player's own
+// box is kept free of water by the game, so the cells just outside the box are sampled as well as the centre.
+float Player::sampleWater(const World& w) const {
+    const float hw = cfg::PLAYER_CORE * 0.5f + 2.5f;
+    int wet = 0;
+    for (int i = 0; i < 8; i++) {
+        const int y = floorToInt(pos.y + (i + 0.5f) * cfg::PLAYER_H / 8.0f);
+        if (w.get(floorToInt(pos.x), y, floorToInt(pos.z)) == M_WATER || w.get(floorToInt(pos.x + hw), y, floorToInt(pos.z)) == M_WATER ||
+            w.get(floorToInt(pos.x - hw), y, floorToInt(pos.z)) == M_WATER || w.get(floorToInt(pos.x), y, floorToInt(pos.z + hw)) == M_WATER ||
+            w.get(floorToInt(pos.x), y, floorToInt(pos.z - hw)) == M_WATER)
+            wet++;
+    }
+    return (float)wet / 8.0f;
+}
+
 void Player::respawn() {
     pos = Vec3(cfg::ARENA_OX + cfg::ARENA_TOTAL * 0.5f, 1.0f + kSkin, cfg::ARENA_OZ + cfg::ARENA_TOTAL * 0.5f + 60.0f);
     vel = Vec3(0, 0, 0);
@@ -51,11 +66,20 @@ float Player::sweepAxis(const World& w, int a, float d) {
     const int b0 = floorToInt(mn[b] + kEps), b1 = (int)std::ceil(mx[b] - kEps) - 1;
     const int c0 = floorToInt(mn[c] + kEps), c1 = (int)std::ceil(mx[c] - kEps) - 1;
     float moved = d;
+    auto tryPlow = [&](int ax, int k, int bb, int bb0, int bb1, int cc, int cc0, int cc1, int sign) {
+        if (!plowEnabled_ || !plowHook || ax == 1) return false;
+        IVec3 lo, hi;
+        lo[ax] = hi[ax] = k;
+        lo[bb] = bb0; hi[bb] = bb1;
+        lo[cc] = cc0; hi[cc] = cc1;
+        return plowHook(lo, hi, ax, sign);
+    };
     if (d > 0) {
         const float M = mx[a];
         const int first = floorToInt(M - kEps) + 1, last = (int)std::ceil(M + d) - 1;
         for (int k = first; k <= last; k++)
             if (slabSolid(w, a, k, b, b0, b1, c, c0, c1)) {
+                if (tryPlow(a, k, b, b0, b1, c, c0, c1, 1)) continue;
                 moved = std::max(0.0f, (float)k - M - kSkin);
                 break;
             }
@@ -64,6 +88,7 @@ float Player::sweepAxis(const World& w, int a, float d) {
         const int first = floorToInt(m + kEps) - 1, last = floorToInt(m + d);
         for (int k = first; k >= last; k--)
             if (slabSolid(w, a, k, b, b0, b1, c, c0, c1)) {
+                if (tryPlow(a, k, b, b0, b1, c, c0, c1, -1)) continue;
                 moved = -std::max(0.0f, m - (float)(k + 1) - kSkin);
                 break;
             }
@@ -75,10 +100,11 @@ float Player::sweepAxis(const World& w, int a, float d) {
 void Player::moveHorizontal(const World& w, int axis, float d) {
     if (d == 0) return;
     const Vec3 start = pos;
+    plowEnabled_ = false;
     const float moved = sweepAxis(w, axis, d);
     const bool blocked = std::fabs(moved) < std::fabs(d) - 1e-3f;
     if (!blocked) return;
-    if (onGround) {  // try stepping up onto a low ledge (sand slopes, rubble)
+    if (onGround) {  // first try stepping up onto a low ledge (sand slopes, rubble)
         const Vec3 afterNormal = pos;
         pos = start;
         const float up = sweepAxis(w, 1, cfg::STEP_HEIGHT);
@@ -87,6 +113,18 @@ void Player::moveHorizontal(const World& w, int axis, float d) {
         const bool landed = down > -(up + 0.5f) + 1e-3f;
         if (landed && std::fabs(moved2) > std::fabs(moved) + 0.05f) return;
         pos = afterNormal;
+        // Too high to climb: wade through it, shoving loose sand aside.
+        if (plowHook && !inWater) {
+            pos = start;
+            plowEnabled_ = true;
+            const float moved3 = sweepAxis(w, axis, d);
+            plowEnabled_ = false;
+            if (std::fabs(moved3) > std::fabs(moved) + 1e-3f) {
+                if (std::fabs(moved3) < std::fabs(d) - 1e-3f) vel[axis] *= 0.6f;  // sand drags at the legs
+                return;
+            }
+            pos = afterNormal;
+        }
     }
     vel[axis] = 0;
 }
@@ -103,20 +141,31 @@ void Player::update(World& w, float dt, const PlayerInput& in) {
     Vec3 wish = fwd * in.forward + right * in.strafe;
     if (lengthSq(wish) > 1.0f) wish = normalize(wish);
 
-    inWater = w.get(floorToInt(pos.x), floorToInt(pos.y + 40.0f), floorToInt(pos.z)) == M_WATER;
+    waterFrac = sampleWater(w);
+    inWater = waterFrac > 0.12f;
     float speed = in.sprint ? cfg::SPRINT_SPEED : cfg::WALK_SPEED;
-    if (inWater) speed *= 0.55f;
+    speed *= 1.0f - 0.55f * waterFrac;  // wading drags at the legs
     wish = wish * speed;
 
-    const float accel = onGround ? 12.0f : (inWater ? 5.0f : 2.5f);
+    const float accel = onGround ? (inWater ? 7.0f : 12.0f) : (inWater ? 5.0f : 2.5f);
     const float t = 1.0f - std::exp(-accel * dt);
     vel.x += (wish.x - vel.x) * t;
     vel.z += (wish.z - vel.z) * t;
 
     if (inWater) {
-        vel.y -= cfg::GRAVITY * 0.2f * dt;
-        if (in.jump) vel.y += 1400.0f * dt;
-        vel.y *= 1.0f / (1.0f + 2.5f * dt);
+        // Buoyancy: neutral when ~65% of the body is submerged; drag grows with submersion.
+        vel.y -= cfg::GRAVITY * (1.0f - 1.55f * waterFrac) * dt;
+        vel.y *= 1.0f / (1.0f + (1.5f + 5.0f * waterFrac) * dt);
+        vel.x *= 1.0f / (1.0f + 1.2f * waterFrac * dt);
+        vel.z *= 1.0f / (1.0f + 1.2f * waterFrac * dt);
+        if (in.jump) {
+            if (waterFrac > 0.55f) {
+                vel.y += 1500.0f * dt;  // kick upwards to swim / break the surface
+            } else if (onGround) {
+                vel.y = cfg::JUMP_SPEED * (1.0f - 0.35f * waterFrac);
+                onGround = false;
+            }
+        }
     } else {
         if (in.jump && onGround) {
             vel.y = cfg::JUMP_SPEED;

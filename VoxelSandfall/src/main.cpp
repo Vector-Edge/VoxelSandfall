@@ -12,6 +12,7 @@
 
 #include "Game.h"
 #include "Log.h"
+#include "Png.h"
 #include "Profile.h"
 #include "Renderer.h"
 
@@ -266,6 +267,117 @@ bool runScript(const std::string& path) {
             game.player.yaw = deg2rad(yaw);
             game.player.pitch = deg2rad(pitch);
             game.player.vel = Vec3(0, 0, 0);
+        } else if (cmd == "viewcam") {  // viewcam x y z yawDeg pitchDeg | viewcam off   (does not move the player)
+            std::string first;
+            ss >> first;
+            if (first == "off") {
+                r.camOverride = false;
+            } else {
+                float yw = 0, pt = 0;
+                ss >> yw;  // first token was x; re-parse
+                float x = (float)atof(first.c_str()), y = yw, z = 0;
+                ss >> z >> yw >> pt;
+                r.camOverride = true;
+                r.camOverridePos = Vec3(x, y, z);
+                r.camOverrideYaw = deg2rad(yw);
+                r.camOverridePitch = deg2rad(pt);
+            }
+        } else if (cmd == "look") {  // look yawDeg pitchDeg
+            float yaw = 0, pitch = 0;
+            ss >> yaw >> pitch;
+            game.player.yaw = deg2rad(yaw);
+            game.player.pitch = deg2rad(pitch);
+        } else if (cmd == "fillsand") {  // fillsand x0 x1 y0 y1 z0 z1
+            int x0, x1, y0, y1, z0, z1;
+            ss >> x0 >> x1 >> y0 >> y1 >> z0 >> z1;
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) game.world.setRaw(x, y, z, M_SAND);
+            game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "fillwater") {  // fillwater x0 x1 y0 y1 z0 z1
+            int x0, x1, y0, y1, z0, z1;
+            ss >> x0 >> x1 >> y0 >> y1 >> z0 >> z1;
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) game.world.setRaw(x, y, z, M_WATER);
+            game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "dumpfield") {  // dumpfield file.png x0 x1 z0 z1   (shore = red, foam = green, ripple = blue; 4 px per voxel)
+            std::string name;
+            int x0 = 0, x1 = 0, z0 = 0, z1 = 0;
+            ss >> name >> x0 >> x1 >> z0 >> z1;
+            const int sc = 4, w = (x1 - x0 + 1) * sc, h = (z1 - z0 + 1) * sc;
+            std::vector<uint8_t> img((size_t)w * h * 4, 255);
+            auto b8 = [](float v) { return (uint8_t)std::clamp((int)(v * 255.0f), 0, 255); };
+            for (int py = 0; py < h; py++)
+                for (int px = 0; px < w; px++) {
+                    const int x = x0 + px / sc, z = z0 + py / sc;
+                    uint8_t* o = &img[((size_t)py * w + px) * 4];
+                    o[0] = b8(game.waterField.shoreAt(x, z) * 2.0f);
+                    o[1] = b8(game.waterField.foamAt(x, z));
+                    o[2] = b8(std::fabs(game.waterField.rippleAt(x, z)) * 4.0f);
+                    if (game.waterField.isWater(x, z)) o[3] = 255;
+                }
+            writePng(name.c_str(), w, h, img.data());
+        } else if (cmd == "dropstone") {  // dropstone x y z halfSize   (a free stone cube: a rigid body that falls)
+            float px, py, pz, hs;
+            ss >> px >> py >> pz >> hs;
+            std::vector<IVec3> cells;
+            for (int z = (int)(pz - hs); z < (int)(pz + hs); z++)
+                for (int y = (int)(py - hs); y < (int)(py + hs); y++)
+                    for (int x = (int)(px - hs); x < (int)(px + hs); x++) cells.push_back(IVec3(x, y, z));
+            game.physics.createFromWorldCells(cells);
+        } else if (cmd == "impacts") {  // impacts on|off   (water splash / soak behaviour, for comparisons)
+            std::string v;
+            ss >> v;
+            game.world.impactsEnabled = v != "off";
+            game.world.soakEnabled = v != "nosoak";
+        } else if (cmd == "filldirt") {  // filldirt x0 x1 y0 y1 z0 z1   (settled dirt, as if it had always been there)
+            int x0, x1, y0, y1, z0, z1;
+            ss >> x0 >> x1 >> y0 >> y1 >> z0 >> z1;
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) game.world.setRaw(x, y, z, M_DIRT);
+            game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "growgrass") {  // growgrass x y z r   (grass on the dirt surface inside the sphere)
+            float px, py, pz, pr;
+            ss >> px >> py >> pz >> pr;
+            int n = 0;
+            game.world.forEachInSphere(Vec3(px, py, pz), pr, [&](int x, int y, int z) { n += game.world.paintGrass(x, y, z) ? 1 : 0; });
+            logLine("growgrass: %d voxels", n);
+        } else if (cmd == "fillstone") {  // fillstone x0 x1 y0 y1 z0 z1
+            int x0, x1, y0, y1, z0, z1;
+            ss >> x0 >> x1 >> y0 >> y1 >> z0 >> z1;
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) game.world.setRaw(x, y, z, M_STONE);
+            game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "dropwater") {  // dropwater x y z radius   (a ball of water appears in the air and falls)
+            float px, py, pz, pr;
+            ss >> px >> py >> pz >> pr;
+            int x0 = 1 << 30, y0 = 1 << 30, z0 = 1 << 30, x1 = -1, y1 = -1, z1 = -1;
+            game.world.forEachInSphere(Vec3(px, py, pz), pr, [&](int x, int y, int z) {
+                game.world.setRaw(x, y, z, M_WATER);
+                x0 = std::min(x0, x); y0 = std::min(y0, y); z0 = std::min(z0, z);
+                x1 = std::max(x1, x); y1 = std::max(y1, y); z1 = std::max(z1, z);
+            });
+            if (x1 >= 0) game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "crater") {  // crater speed  (as if the player landed hard at this spot)
+            float sp = 300;
+            ss >> sp;
+            game.sandCrater(sp);
+        } else if (cmd == "walk" || cmd == "run") {  // walk seconds   (forward input; run = sprint)
+            double sec = 1;
+            ss >> sec;
+            GameInput gi;
+            gi.forward = 1;
+            gi.sprint = (cmd == "run");
+            const int n = std::max(1, (int)(sec * 60.0 + 0.5));
+            for (int i = 0; i < n && g_running; i++) {
+                game.update(1.0f / 60.0f, gi);
+                r.speedForBob = std::sqrt(game.player.vel.x * game.player.vel.x + game.player.vel.z * game.player.vel.z);
+                r.render(game, 1.0f / 60.0f);
+                if ((i & 15) == 0) pumpMessages();
+            }
         } else if (cmd == "freeze") {
             std::string v;
             ss >> v;
@@ -277,7 +389,7 @@ bool runScript(const std::string& path) {
         } else if (cmd == "material") {
             std::string v;
             ss >> v;
-            game.materialIndex = v == "sand" ? 0 : v == "water" ? 1 : v == "stone" ? 2 : 3;
+            game.materialIndex = v == "sand" ? 0 : v == "water" ? 1 : v == "stone" ? 2 : v == "dirt" ? 4 : v == "grass" ? 5 : 3;
         } else if (cmd == "brush") {
             int b = 4;
             ss >> b;
@@ -318,6 +430,10 @@ bool runScript(const std::string& path) {
             ss >> az >> el;
             r.sunAzimuth = az;
             r.sunElevation = el;
+        } else if (cmd == "quality") {  // quality auto|0..4
+            std::string v;
+            ss >> v;
+            r.quality = v == "auto" ? -1 : std::clamp(atoi(v.c_str()), 0, 4);
         } else if (cmd == "rays") {
             ss >> r.skyRays;
         } else if (cmd == "hud") {
@@ -337,7 +453,11 @@ bool runScript(const std::string& path) {
             for (int i = 0; i < prof::P_COUNT; i++) logLine("   cpu %-18s %7.2f | %7.2f", prof::kNames[i], prof::g_avg[i], prof::g_max[i]);
             logLine("   cpu %-18s %7.2f", "TOTAL (no present)", cpu);
             for (int i = 0; i < prof::G_COUNT; i++) logLine("   gpu %-18s %7.2f | %7.2f", prof::kGpuNames[i], prof::g_gpuAvg[i], prof::g_gpuMax[i]);
-            logLine("   world: sand=%lld water=%lld active=%zu simTicks/frame=%d bodies=%zu", game.world.counts[M_SAND], game.world.counts[M_WATER], game.world.activeCount(), game.lastSimTicks, game.physics.bodies.size());
+            logLine("   sim phases (ms total): parallel %.1f, impacts %.1f (%lld handled), hops %.1f; cell visits %lld, moves %lld", game.world.dbgParMs, game.world.dbgImpactMs, game.world.dbgImpacts, game.world.dbgHopMs, game.world.dbgVisits, game.world.dbgMoves);
+            game.world.dbgParMs = game.world.dbgImpactMs = game.world.dbgHopMs = 0;
+            game.world.dbgImpacts = game.world.dbgVisits = game.world.dbgMoves = 0;
+            logLine("   water field: %d tiles active, %zu particles", game.waterField.activeTiles(), game.particles.size());
+            logLine("   world: sand=%lld water=%lld dirt=%lld grass=%lld active=%zu simTicks/frame=%d bodies=%zu", game.world.counts[M_SAND], game.world.counts[M_WATER], game.world.counts[M_DIRT], game.world.counts[M_GRASS], game.world.activeCount(), game.lastSimTicks, game.physics.bodies.size());
         } else if (cmd == "profiler") {
             std::string v;
             ss >> v;
@@ -349,6 +469,8 @@ bool runScript(const std::string& path) {
         } else if (cmd == "log") {
             std::string rest;
             std::getline(ss, rest);
+            logLine("   player: pos=(%.1f %.1f %.1f) vel=(%.1f %.1f %.1f) onGround=%d grains=%d", game.player.pos.x, game.player.pos.y, game.player.pos.z,
+                    game.player.vel.x, game.player.vel.y, game.player.vel.z, (int)game.player.onGround, game.grainsInFlight());
             if (!game.physics.bodies.empty()) {
                 const Body& b0 = *game.physics.bodies[0];
                 logLine("   body0: pos=(%.1f %.1f %.1f) vel=%.2f ang=%.3f count=%d asleep=%d", b0.pos.x, b0.pos.y, b0.pos.z, length(b0.vel), length(b0.ang), b0.count, (int)b0.asleep);
@@ -389,7 +511,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     int width = 1600, height = 900;
     std::string scriptPath;
-    int rays = -1, msaa = 4;
+    int rays = -1, msaa = 4, qualityArg = -1;
+    bool qualityGiven = false;
     bool noVsync = false;
     float autoQuit = 0;
     for (size_t i = 1; i < args.size(); i++) {
@@ -409,6 +532,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             autoQuit = (float)atof(args[++i].c_str());
         } else if (a == "--novsync") {
             noVsync = true;
+        } else if (a == "--quality" && i + 1 < args.size()) {
+            const std::string q = args[++i];
+            qualityArg = q == "auto" ? -1 : std::clamp(atoi(q.c_str()), 0, 4);
+            qualityGiven = true;
         }
     }
     g_scriptMode = !scriptPath.empty();
@@ -428,6 +555,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         return 3;
     }
     if (rays >= 0) renderer.skyRays = rays;
+    renderer.quality = qualityGiven ? qualityArg : 4;  // full detail unless asked otherwise
+    if (renderer.quality >= 0) renderer.setQualityNow(renderer.quality);
     if (noVsync) renderer.vsync = false;
     logLine("renderer ready on %s", renderer.adapterName.c_str());
 
@@ -469,6 +598,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (pressed(VK_F6)) renderer.skyRays = renderer.skyRays == 0 ? 4 : renderer.skyRays == 4 ? 8 : renderer.skyRays == 8 ? 16 : 0;
         if (pressed(VK_F7)) renderer.vsync = !renderer.vsync;
         if (pressed(VK_F8)) renderer.cycleMsaa();
+        if (pressed(VK_F12)) renderer.quality = renderer.quality >= 4 ? -1 : renderer.quality + 1;  // auto, 0 .. 4
         if (pressed(VK_F9)) renderer.reloadShaders();
         if (pressed(VK_F11)) toggleFullscreen();
         if (pressed(VK_F2)) {
@@ -493,7 +623,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             gi.wheel = g_wheel;
             gi.selectCreator = pressed('R');
             gi.selectGun = pressed('F');
-            for (int k = 1; k <= 4; k++)
+            for (int k = 1; k <= kPaintMaterialCount; k++)
                 if (pressed('0' + k)) gi.selectMaterial = k;
             if (pressed('E')) gi.cycleMaterial = 1;
             if (pressed('Q')) gi.cycleMaterial = -1;

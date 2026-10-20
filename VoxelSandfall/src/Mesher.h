@@ -26,6 +26,13 @@ struct MeshData {
 // (reads the world only); ambient occlusion for these meshes is computed per pixel from the occupancy volume.
 void buildChunkMesh(const World& w, int cx, int cy, int cz, MeshData& opaque, MeshData& water);
 
+// Only the water faces of a chunk (for chunks where just water moved). Thread-safe.
+void buildChunkWaterMesh(const World& w, int cx, int cy, int cz, MeshData& water);
+
+// Per-column map of the open water in a chunk, read from its water mesh: out[x + 32 * z] = height (1..32, local) of the
+// highest water surface plane in that column, 0 = none. Thread-safe.
+void waterTopsOfMesh(const MeshData& water, int cx, int cy, int cz, uint8_t out[1024]);
+
 // 64 bytes: occupancy of the chunk's 4x4x4 bricks of 8^3 voxels (index bx + 4*(by + 4*bz)). Thread-safe.
 void computeBricks(const World& w, int chunkIndex, uint8_t out[64]);
 

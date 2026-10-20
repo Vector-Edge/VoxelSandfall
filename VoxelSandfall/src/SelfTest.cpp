@@ -4,6 +4,7 @@
 #include <cstdio>
 
 #include "Game.h"
+#include "Mesher.h"
 #include "Parallel.h"
 
 namespace {
@@ -108,15 +109,15 @@ void testSand(Game& g) {
                     if (g.world.get(x, y - 1, z) == M_AIR) floating++;
                 }
     CHECK(floating == 0, "no sand left floating in mid air (%d)", floating);
-    CHECK(maxY < 30, "sand piled into a low heap (max height %d)", maxY);
-    // Sand slides diagonally: width of the heap must exceed the initial 9x9 footprint.
-    int minX = 9999, maxX = -9999;
-    for (int x = cx() - 60; x <= cx() + 60; x++)
-        if (g.world.get(x, 1, cz()) == M_SAND) {
-            minX = std::min(minX, x);
-            maxX = std::max(maxX, x);
-        }
-    CHECK(maxX - minX > 12, "heap spread beyond its footprint (width %d)", maxX - minX + 1);
+    // Angle of repose of the heap: base radius from the footprint area, height from the tallest grain.
+    int footprint = 0;
+    for (int z = cz() - 60; z <= cz() + 60; z++)
+        for (int x = cx() - 60; x <= cx() + 60; x++) footprint += g.world.get(x, 1, z) == M_SAND;
+    const double rEq = std::sqrt((double)footprint / 3.14159265);
+    const double angle = std::atan2((double)maxY, rEq) * 180.0 / 3.14159265;
+    tlog("  heap: footprint %d cells (r=%.1f), height %d -> repose angle %.1f deg\n", footprint, rEq, maxY, angle);
+    CHECK(angle > 38.0 && angle < 75.0, "sand piles into a steep, clumpy heap (%.0f degrees)", angle);
+    CHECK(footprint > 81, "heap spread beyond its 9x9 footprint (%d cells)", footprint);
 }
 
 void testWater(Game& g) {
@@ -153,6 +154,577 @@ void testWater(Game& g) {
     CHECK(layer1 * 10 >= placed * 8, "water flattened into a sheet (%d of %d voxels on the floor, %d layers)", layer1, placed, layers);
     CHECK(maxX - minX > 14, "water spread laterally across the floor (width %d)", maxX - minX + 1);
     CHECK(unsupported < 6, "water does not hang in mid air (%d in transit)", unsupported);
+}
+
+// Runs the whole game loop (player, sim, particles) for `seconds` with a constant input.
+void runGame(Game& g, float seconds, const GameInput& in) {
+    const int n = (int)(seconds * 60.0f);
+    for (int i = 0; i < n; i++) g.update(1.0f / 60.0f, in);
+}
+
+void fillSand(Game& g, int x0, int x1, int y0, int y1, int z0, int z1) {
+    for (int z = z0; z <= z1; z++)
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++) g.world.setRaw(x, y, z, M_SAND);
+    g.world.notifyBox(x0, y0, z0, x1, y1, z1);
+}
+
+void testSandWading(Game& g) {
+    tlog("[player wades through a sand pile]\n");
+    g.reset();
+    fillSand(g, cx() - 90, cx() + 90, 1, 12, cz() - 40, cz() + 10);
+    settle(g, 20000);
+    const long long sand0 = g.world.counts[M_SAND];
+    g.player.pos = Vec3((float)cx(), 1.0f, (float)cz() + 70.0f);
+    g.player.vel = Vec3(0, 0, 0);
+    g.player.yaw = 0;  // facing -Z, straight into the pile
+    GameInput in;
+    in.forward = 1;
+    in.sprint = true;
+    runGame(g, 5.0f, in);
+    tlog("  player z=%.1f y=%.1f (pile spanned z %d..%d)\n", g.player.pos.z, g.player.pos.y, cz() - 40, cz() + 10);
+    CHECK(g.player.pos.z < (float)(cz() - 25), "the player walks right through the pile instead of being stopped (z=%.1f)", g.player.pos.z);
+    runGame(g, 4.0f, GameInput());
+    CHECK(g.grainsInFlight() == 0, "all shoved grains have landed (%d still flying)", g.grainsInFlight());
+    const long long sand1 = g.world.counts[M_SAND];
+    CHECK(sand1 > sand0 * 95 / 100 && sand1 <= sand0, "sand is pushed aside, not destroyed (%lld -> %lld voxels)", sand0, sand1);
+    CHECK(g.player.pos.y < 20.0f, "the player ends up on the ground, not buried or launched (y=%.1f)", g.player.pos.y);
+}
+
+void testSandFootsteps(Game& g) {
+    tlog("[footsteps in sand]\n");
+    g.reset();
+    fillSand(g, cx() - 100, cx() + 100, 1, 5, cz() - 120, cz() + 120);
+    settle(g, 20000);
+    const long long sand0 = g.world.counts[M_SAND];
+    g.player.pos = Vec3((float)cx(), 6.0f, (float)cz() + 100.0f);
+    g.player.vel = Vec3(0, 0, 0);
+    g.player.yaw = 0;
+    GameInput in;
+    in.forward = 1;
+    runGame(g, 3.0f, in);
+    runGame(g, 4.0f, GameInput());
+    int dents = 0, scattered = 0;
+    for (int z = cz() - 120; z <= cz() + 120; z++)
+        for (int x = cx() - 30; x <= cx() + 30; x++) {
+            dents += (g.world.get(x, 5, z) == M_AIR);   // a hole in the old surface
+            scattered += (g.world.get(x, 6, z) == M_SAND);  // grains lying on top of it
+        }
+    tlog("  %d dented surface cells, %d kicked grains lying on the surface\n", dents, scattered);
+    CHECK(dents > 40, "walking leaves footprints in the sand (%d dented cells)", dents);
+    CHECK(scattered > 20, "kicked-up grains land back on the surface (%d)", scattered);
+    const long long sand1 = g.world.counts[M_SAND];
+    CHECK(sand1 < sand0 && sand1 > sand0 - 6000, "only a little sand is compacted away (%lld -> %lld)", sand0, sand1);
+}
+
+void testSandCrater(Game& g) {
+    tlog("[landing crater]\n");
+    g.reset();
+    fillSand(g, cx() - 80, cx() + 80, 1, 6, cz() - 80, cz() + 80);
+    settle(g, 20000);
+    const long long sand0 = g.world.counts[M_SAND];
+    g.player.pos = Vec3((float)cx(), 130.0f, (float)cz());
+    g.player.vel = Vec3(0, 0, 0);
+    runGame(g, 3.5f, GameInput());
+    int dents = 0;
+    for (int z = cz() - 20; z <= cz() + 20; z++)
+        for (int x = cx() - 20; x <= cx() + 20; x++) dents += (g.world.get(x, 6, z) == M_AIR);
+    tlog("  crater: %d cells missing from the top layer, sand %lld -> %lld\n", dents, sand0, g.world.counts[M_SAND]);
+    CHECK(dents > 120, "a hard landing digs a crater (%d cells)", dents);
+    CHECK(g.player.onGround && g.player.pos.y < 20.0f, "and the player stands in it afterwards (y=%.1f)", g.player.pos.y);
+    CHECK(g.world.counts[M_SAND] > sand0 - 1500, "most of the sand is thrown out onto the rim (%lld left)", g.world.counts[M_SAND]);
+}
+
+// A walled basin: returns the interior bounds.
+struct Basin { int x0, x1, z0, z1; };
+Basin buildBasin(Game& g, int half, int wallH) {
+    Basin b{cx() - half, cx() + half - 1, cz() - half, cz() + half - 1};
+    for (int z = b.z0 - 3; z <= b.z1 + 3; z++)
+        for (int x = b.x0 - 3; x <= b.x1 + 3; x++) {
+            const bool inside = x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1;
+            if (inside) continue;
+            for (int y = 1; y <= wallH; y++) g.world.setRaw(x, y, z, M_STONE);
+        }
+    g.world.notifyBox(b.x0 - 3, 0, b.z0 - 3, b.x1 + 3, wallH, b.z1 + 3);
+    return b;
+}
+
+// Fraction of columns whose surface is within the two integer levels that bracket the mean depth.
+double flatFraction(Game& g, int x0, int x1, int z0, int z1, long long volume, int* lo, int* hi) {
+    const int cols = (x1 - x0 + 1) * (z1 - z0 + 1);
+    const double mean = (double)volume / (double)cols;
+    const int fl = (int)std::floor(mean + 1e-9), ce = (int)std::ceil(mean - 1e-9);
+    int good = 0;
+    *lo = 1 << 30;
+    *hi = -1;
+    for (int z = z0; z <= z1; z++)
+        for (int x = x0; x <= x1; x++) {
+            int h = 0;
+            for (int y = 1; y < 60; y++)
+                if (g.world.get(x, y, z) == M_WATER) h = y;
+            *lo = std::min(*lo, h);
+            *hi = std::max(*hi, h);
+            good += (h >= fl && h <= ce);
+        }
+    return (double)good / (double)cols;
+}
+
+void testWaterLevel(Game& g) {
+    tlog("[water finds its level]\n");
+    g.reset();
+    const Basin b = buildBasin(g, 30, 45);
+    long long placed = 0;
+    for (int z = b.z0; z < b.z0 + 20; z++)
+        for (int y = 1; y <= 40; y++)
+            for (int x = b.x0; x < b.x0 + 20; x++) {
+                g.world.setRaw(x, y, z, M_WATER);
+                placed++;
+            }
+    g.world.notifyBox(b.x0, 1, b.z0, b.x0 + 19, 40, b.z0 + 19);
+    double t0 = nowMs();
+    int ticks = settle(g, 30000);
+    double t1 = nowMs();
+    int lo, hi;
+    const double flat = flatFraction(g, b.x0, b.x1, b.z0, b.z1, placed, &lo, &hi);
+    tlog("  %lld voxels poured into one corner of a 60x60 basin: settled after %d ticks (%.0f ms), surface heights %d..%d, %.1f%% of columns at the mean level\n", placed, ticks, t1 - t0, lo, hi, flat * 100.0);
+    CHECK(ticks > 0, "the pool comes to rest");
+    CHECK(g.world.counts[M_WATER] == placed, "no water lost (%lld/%lld)", g.world.counts[M_WATER], placed);
+    CHECK(flat > 0.97 && hi - lo <= 2, "the whole basin is flat (%.1f%% of columns at the mean level, heights %d..%d)", flat * 100.0, lo, hi);
+}
+
+void testWaterLevelWide(Game& g) {
+    tlog("[water finds its level across a wide floor]\n");
+    g.reset();
+    // A raised stone ring around a 120 x 24 trench; pour water at one end.
+    for (int z = cz() - 12 - 3; z <= cz() + 11 + 3; z++)
+        for (int x = cx() - 60 - 3; x <= cx() + 59 + 3; x++) {
+            const bool inside = x >= cx() - 60 && x <= cx() + 59 && z >= cz() - 12 && z <= cz() + 11;
+            if (inside) continue;
+            for (int y = 1; y <= 30; y++) g.world.setRaw(x, y, z, M_STONE);
+        }
+    long long placed = 0;
+    for (int z = cz() - 12; z <= cz() + 11; z++)
+        for (int y = 1; y <= 24; y++)
+            for (int x = cx() - 60; x < cx() - 40; x++) {
+                g.world.setRaw(x, y, z, M_WATER);
+                placed++;
+            }
+    g.world.notifyBox(cx() - 63, 0, cz() - 15, cx() + 62, 30, cz() + 14);
+    settle(g, 40000);
+    int lo, hi;
+    const double flat = flatFraction(g, cx() - 60, cx() + 59, cz() - 12, cz() + 11, placed, &lo, &hi);
+    tlog("  %lld voxels at one end of a 120x24 trench -> heights %d..%d, %.1f%% of columns at the mean level\n", placed, lo, hi, flat * 100.0);
+    CHECK(flat > 0.92 && hi - lo <= 2, "water has flowed the full length and is (nearly) flat (%.1f%% at the mean level, heights %d..%d)", flat * 100.0, lo, hi);
+}
+
+// Water voxels currently inside the player's box (the game keeps this at zero).
+int waterInsideBox(Game& g) {
+    const float hw = cfg::PLAYER_CORE * 0.5f;
+    const Vec3 mn(g.player.pos.x - hw, g.player.pos.y, g.player.pos.z - hw), mx(g.player.pos.x + hw, g.player.pos.y + cfg::PLAYER_H, g.player.pos.z + hw);
+    int n = 0;
+    for (int z = floorToInt(mn.z + 0.01f); z <= (int)std::ceil(mx.z - 0.01f) - 1; z++)
+        for (int y = floorToInt(mn.y + 0.01f); y <= std::min((int)std::ceil(mx.y - 0.01f) - 1, floorToInt(mn.y) + 40); y++)
+            for (int x = floorToInt(mn.x + 0.01f); x <= (int)std::ceil(mx.x - 0.01f) - 1; x++) n += g.world.get(x, y, z) == M_WATER;
+    return n;
+}
+
+void fillWater(Game& g, const Basin& b, int depth) {
+    for (int z = b.z0; z <= b.z1; z++)
+        for (int y = 1; y <= depth; y++)
+            for (int x = b.x0; x <= b.x1; x++) g.world.setRaw(x, y, z, M_WATER);
+    g.world.notifyBox(b.x0, 1, b.z0, b.x1, depth, b.z1);
+}
+
+// Highest water voxel that is connected to the pool floor by an unbroken column of water, over a footprint.
+int poolMoundTop(Game& g, const Basin& b) {
+    int top = 0;
+    for (int z = b.z0; z <= b.z1; z++)
+        for (int x = b.x0; x <= b.x1; x++) {
+            int y = 1;
+            while (y < g.world.SY && g.world.get(x, y, z) == M_WATER) y++;
+            top = std::max(top, y - 1);
+        }
+    return top;
+}
+
+void testWaterImpact(Game& g) {
+    tlog("[falling water splashes into a pool instead of piling on top]\n");
+    g.reset();
+    const Basin b = buildBasin(g, 60, 90);
+    const int level = 12;
+    fillWater(g, b, level);
+    settle(g, 5000);
+    long long blob = 0;
+    g.world.forEachInSphere(Vec3((float)cx(), 60.0f, (float)cz()), 9.0f, [&](int x, int y, int z) {
+        g.world.setRaw(x, y, z, M_WATER);
+        blob++;
+    });
+    g.world.notifyBox(cx() - 10, 48, cz() - 10, cx() + 10, 72, cz() + 10);
+    const long long water0 = g.world.counts[M_WATER];
+    int peakMound = 0, events = 0, heapTicks = 0;  // heapTicks: ticks the blob stays heaped more than 6 voxels above the pool
+    g.world.splashes.clear();
+    for (int t = 0; t < 300; t++) {
+        g.world.simTick(g.rng);
+        events += (int)g.world.splashes.size();
+        g.world.splashes.clear();
+        const int mound = poolMoundTop(g, b) - level;
+        peakMound = std::max(peakMound, mound);
+        heapTicks += mound > 6;
+    }
+    tlog("  a %lld voxel blob dropped from 48 voxels onto a pool %d deep: peak %d voxels above the pool on arrival, heaped (>6) for %d ticks, %d splash events\n",
+         blob, level, peakMound, heapTicks, events);
+    CHECK(g.world.counts[M_WATER] == water0, "no water created or lost (%lld -> %lld)", water0, g.world.counts[M_WATER]);
+    // Without soaking, the blob sits on the surface and slowly spreads (about 35 ticks above 6 voxels).
+    CHECK(heapTicks <= 12, "the blob soaks into the pool instead of lying on it like slime (%d ticks heaped)", heapTicks);
+    CHECK(events > 0, "the impact is reported as a splash (%d events)", events);
+    settle(g, 20000);
+    int lo, hi;
+    const double flat = flatFraction(g, b.x0, b.x1, b.z0, b.z1, g.world.counts[M_WATER], &lo, &hi);
+    CHECK(flat > 0.9 && hi - lo <= 3, "and the pool ends up level (%.1f%% of columns at the mean, heights %d..%d)", flat * 100.0, lo, hi);
+}
+
+// Per-column open-water surface heights, built the way the renderer does it (from the water meshes of every chunk).
+std::vector<uint16_t> buildWaterTopMap(Game& g) {
+    World& w = g.world;
+    std::vector<uint16_t> map((size_t)WaterField::W * WaterField::D, 0);
+    static MeshData opaque, water;
+    uint8_t tops[1024];
+    for (int cz = 0; cz < w.CZ; cz++)
+        for (int cy = 0; cy < w.CY; cy++)
+            for (int cx = 0; cx < w.CX; cx++) {
+                buildChunkMesh(w, cx, cy, cz, opaque, water);
+                waterTopsOfMesh(water, cx, cy, cz, tops);
+                for (int lz = 0; lz < 32; lz++)
+                    for (int lx = 0; lx < 32; lx++) {
+                        const uint8_t t = tops[lx + 32 * lz];
+                        if (!t) continue;
+                        uint16_t& m = map[(size_t)(cz * 32 + lz) * WaterField::W + (size_t)(cx * 32 + lx)];
+                        m = std::max<uint16_t>(m, (uint16_t)(cy * 32 + t));
+                    }
+            }
+    return map;
+}
+
+void testWaterField(Game& g) {
+    tlog("[water surface field: ripples, foam, smooth surface]\n");
+    g.reset();
+    const Basin b = buildBasin(g, 40, 40);
+    fillWater(g, b, 10);
+    settle(g, 5000);
+    const std::vector<uint16_t> map = buildWaterTopMap(g);
+    int wrong = 0, wet = 0;
+    for (int z = 0; z < WaterField::D; z++)
+        for (int x = 0; x < WaterField::W; x++) {
+            const bool inside = x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1;
+            const uint16_t t = map[(size_t)z * WaterField::W + (size_t)x];
+            wet += t != 0;
+            wrong += inside ? (t != 11) : (t != 0);
+        }
+    tlog("  surface map: %d wet columns, %d wrong\n", wet, wrong);
+    CHECK(wrong == 0 && wet == (b.x1 - b.x0 + 1) * (b.z1 - b.z0 + 1), "the renderer's surface map matches the pool exactly (%d wrong columns)", wrong);
+
+    WaterField f;
+    f.setSurface(map.data());
+    CHECK(f.hasWater() && f.isWater(cx(), cz()) && !f.isWater(b.x0 - 5, cz()), "the field knows where the water is");
+    f.impulse((float)cx(), (float)cz(), 0.5f, 3.0f, 0.5f);
+    CHECK(f.rippleAt(cx(), cz()) < -0.2f && f.foamAt(cx(), cz()) > 0.2f, "a drop presses the surface down and leaves foam (%.2f, foam %.2f)", f.rippleAt(cx(), cz()), f.foamAt(cx(), cz()));
+    f.impulse((float)(b.x0 - 10), (float)cz(), 0.5f, 3.0f, 0.5f);
+    CHECK(f.rippleAt(b.x0 - 10, cz()) == 0.0f, "drops outside the water do nothing");
+    float ringAt = 0;
+    for (int i = 0; i < 60; i++) {
+        f.step(1.0f / 60.0f);
+        if (i == 59) {
+            for (int d = 3; d < 30; d++) ringAt = std::max(ringAt, std::fabs(f.rippleAt(cx() + d, cz())));
+        }
+    }
+    CHECK(ringAt > 0.01f, "after a second the ripple has travelled outwards (peak %.3f away from the centre)", ringAt);
+    bool finite = true, outside = false;
+    for (int i = 0; i < 600; i++) {
+        f.step(1.0f / 60.0f);
+        const float c = f.rippleAt(cx(), cz());
+        finite &= std::isfinite(c) && std::fabs(c) < 3.0f;
+    }
+    for (int x = 0; x < WaterField::W; x++) outside |= (x < b.x0 || x > b.x1) && f.rippleAt(x, cz()) != 0.0f;
+    CHECK(finite, "the wave simulation stays stable");
+    CHECK(f.peakRipple() < 0.01f, "ripples die away (%.4f left after 11 s)", f.peakRipple());
+    CHECK(!outside, "ripples stay inside the water");
+    // The texture: a flat pool has no slope, the rim of the pool counts as shore.
+    WaterField calm;
+    calm.setSurface(map.data());
+    const uint16_t* t = calm.texels();
+    CHECK(t[((size_t)cz() * WaterField::W + cx()) * 4 + 0] == 0 && t[((size_t)cz() * WaterField::W + cx()) * 4 + 1] == 0, "a flat pool has no surface slope");
+    const uint16_t shoreRim = t[((size_t)cz() * WaterField::W + b.x0) * 4 + 3], shoreMid = t[((size_t)cz() * WaterField::W + cx()) * 4 + 3];
+    CHECK(shoreRim > shoreMid, "the rim of the pool counts as shore");
+    // A staircase surface (one voxel step) is smoothed into a gentle slope.
+    std::vector<uint16_t> stairs = map;
+    for (int z = b.z0; z <= b.z1; z++)
+        for (int x = cx(); x <= b.x1; x++) stairs[(size_t)z * WaterField::W + (size_t)x] = 12;
+    WaterField st;
+    st.setSurface(stairs.data());
+    const float mid = st.smoothAt(cx() - 1, cz()), hi = st.smoothAt(cx() + 6, cz()), lo = st.smoothAt(cx() - 8, cz());
+    CHECK(lo < mid && mid < hi && hi - lo <= 1.001f, "a one-voxel step in the surface is blended over several voxels (%.2f %.2f %.2f)", lo, mid, hi);
+    CHECK(st.active() == false && !st.consumeDirty() == false, "uploading it marks the texture dirty");
+}
+
+int waterParticlesInFlight(Game& g) {
+    int n = 0;
+    for (const Particle& p : g.particles) n += (p.grain && p.mat == M_WATER) ? 1 : 0;
+    return n;
+}
+
+void testWaterSplash(Game& g) {
+    tlog("[a falling ball of water: splash, droplets, ripples, nothing lost]\n");
+    g.reset();
+    g.player.pos = Vec3(20.0f, 1.0f, 20.0f);
+    g.player.vel = Vec3(0, 0, 0);
+    const Basin b = buildBasin(g, 60, 90);
+    fillWater(g, b, 12);
+    settle(g, 5000);
+    long long blob = 0;
+    g.world.forEachInSphere(Vec3((float)cx(), 70.0f, (float)cz()), 10.0f, [&](int x, int y, int z) {
+        g.world.setRaw(x, y, z, M_WATER);
+        blob++;
+    });
+    g.world.notifyBox(cx() - 11, 58, cz() - 11, cx() + 11, 82, cz() + 11);
+    const long long total = g.world.counts[M_WATER];
+    // The renderer normally supplies the water surface; do it here so the ripples have something to run on.
+    const std::vector<uint16_t> map = buildWaterTopMap(g);
+    g.waterField.setSurface(map.data());
+    int maxDroplets = 0, maxSpray = 0;
+    float peakRipple = 0, peakFoam = 0;
+    for (int i = 0; i < 90; i++) {
+        g.update(1.0f / 60.0f, GameInput());
+        maxDroplets = std::max(maxDroplets, waterParticlesInFlight(g));
+        maxSpray = std::max(maxSpray, (int)g.particles.size() - g.grainsInFlight());
+        peakRipple = std::max(peakRipple, g.waterField.peakRipple());
+        for (int dx = -14; dx <= 14; dx += 2) peakFoam = std::max(peakFoam, g.waterField.foamAt(cx() + dx, cz()));
+    }
+    tlog("  %lld voxel ball dropped from 58 voxels: up to %d droplets and %d spray cubes in the air, ripples up to %.2f voxels, foam %.2f\n", blob, maxDroplets, maxSpray, peakRipple, peakFoam);
+    CHECK(maxDroplets > 20, "the impact throws up droplets (%d at once)", maxDroplets);
+    CHECK(peakRipple > 0.05f && peakFoam > 0.05f, "and it sets the surface rocking and leaves foam (ripple %.2f, foam %.2f)", peakRipple, peakFoam);
+    runGame(g, 6.0f, GameInput());
+    CHECK(waterParticlesInFlight(g) == 0, "every droplet has landed again (%d in the air)", waterParticlesInFlight(g));
+    CHECK(g.world.counts[M_WATER] == total, "no water created or lost (%lld -> %lld, %d droplets could not land)", total, g.world.counts[M_WATER], g.lostGrains);
+    CHECK(g.world.splashes.empty(), "the splash events were all handled");
+    settle(g, 20000);
+    int lo, hi;
+    const double flat = flatFraction(g, b.x0, b.x1, b.z0, b.z1, g.world.counts[M_WATER], &lo, &hi);
+    CHECK(flat > 0.9 && hi - lo <= 3, "the pool ends up level (%.1f%% of columns at the mean, heights %d..%d)", flat * 100.0, lo, hi);
+}
+
+// ---- dirt and grass -------------------------------------------------------------------------------------------
+void fillBox(Game& g, uint8_t m, int x0, int x1, int y0, int y1, int z0, int z1) {
+    for (int z = z0; z <= z1; z++)
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++) g.world.setRaw(x, y, z, m);
+    g.world.notifyBox(x0, y0, z0, x1, y1, z1);
+}
+
+int countIn(Game& g, uint8_t m, int x0, int x1, int y0, int y1, int z0, int z1) {
+    int n = 0;
+    for (int z = z0; z <= z1; z++)
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++) n += g.world.get(x, y, z) == m;
+    return n;
+}
+
+int looseDirt(Game& g) {
+    int n = 0;
+    for (size_t i = 0; i < g.world.data.size(); i++) n += ((g.world.data[i] & VOX_MASK) == M_DIRT && (g.world.data[i] & VOX_LOOSE)) ? 1 : 0;
+    return n;
+}
+
+void testDirtPile(Game& g) {
+    tlog("[dirt: clumpier than sand]\n");
+    g.reset();
+    // the same lump of sand and of loose dirt dropped side by side
+    const int sandX = cx() - 60, dirtX = cx() + 40;
+    for (int z = cz() - 10; z < cz() + 10; z++)
+        for (int y = 40; y < 70; y++)
+            for (int x = 0; x < 20; x++) {
+                g.world.setRaw(sandX + x, y, z, M_SAND);
+                g.world.setLooseDirt(dirtX + x, y, z);
+            }
+    g.world.notifyBox(sandX, 40, cz() - 10, sandX + 19, 69, cz() + 9);
+    g.world.notifyBox(dirtX, 40, cz() - 10, dirtX + 19, 69, cz() + 9);
+    const long long sand0 = g.world.counts[M_SAND], dirt0 = g.world.counts[M_DIRT];
+    settle(g, 20000);
+    auto footprint = [&](int x0, uint8_t m) {
+        int cols = 0;
+        for (int z = cz() - 60; z < cz() + 60; z++)
+            for (int x = x0 - 40; x < x0 + 60; x++) {
+                bool any = false;
+                for (int y = 1; y < 90 && !any; y++) any = g.world.get(x, y, z) == m;
+                cols += any;
+            }
+        return cols;
+    };
+    const int fs = footprint(sandX, M_SAND), fd = footprint(dirtX, M_DIRT);
+    tlog("  the same %lld voxels spread over %d columns as sand and %d as dirt\n", sand0, fs, fd);
+    CHECK(g.world.counts[M_SAND] == sand0 && g.world.counts[M_DIRT] == dirt0, "nothing lost (sand %lld/%lld, dirt %lld/%lld)", g.world.counts[M_SAND], sand0, g.world.counts[M_DIRT], dirt0);
+    CHECK(fd * 10 < fs * 8, "the dirt heap is steeper and narrower than the sand heap (%d vs %d columns)", fd, fs);
+    CHECK(looseDirt(g) == 0, "all the dirt has settled (%d loose voxels)", looseDirt(g));
+}
+
+void testDirtStructure(Game& g) {
+    tlog("[dirt: overhangs hold, necks and cut-off lumps break]\n");
+    g.reset();
+    // a stone wall to hang things from, and four dirt arms of different strength
+    fillBox(g, M_STONE, 60, 63, 1, 60, 40, 200);
+    // short thick arm: 10 long, 10 wide, 3 thick, tied to the wall along 10 x 3 faces -> mass 300 / 30 contacts = 10: holds
+    fillBox(g, M_DIRT, 64, 73, 30, 32, 50, 59);
+    // very long arm: 30 long -> 900 / 30 = 30: breaks
+    fillBox(g, M_DIRT, 64, 93, 30, 32, 100, 109);
+    // a big block on a 2x2 neck: 15^3 lump + neck, only 4 contact faces
+    fillBox(g, M_DIRT, 64, 66, 30, 31, 150, 151);
+    fillBox(g, M_DIRT, 67, 81, 25, 39, 143, 157);
+    // a lump floating in mid air (no contact at all)
+    fillBox(g, M_DIRT, 120, 129, 40, 49, 100, 109);
+    const int armA = countIn(g, M_DIRT, 64, 73, 30, 32, 50, 59), armB = countIn(g, M_DIRT, 64, 93, 30, 32, 100, 109);
+    const int total0 = (int)g.world.counts[M_DIRT];
+    tlog("  arms: short %d voxels, long %d; total dirt %d\n", armA, armB, total0);
+    settle(g, 20000);
+    const int armA1 = countIn(g, M_DIRT, 64, 73, 30, 32, 50, 59), armB1 = countIn(g, M_DIRT, 64, 93, 30, 32, 100, 109);
+    const int blob1 = countIn(g, M_DIRT, 64, 81, 25, 39, 143, 157), air1 = countIn(g, M_DIRT, 120, 129, 40, 49, 100, 109);
+    tlog("  after: short arm %d/%d, long arm %d/%d, lump on the neck %d, floating lump %d\n", armA1, armA, armB1, armB, blob1, air1);
+    CHECK(armA1 == armA, "a short, thick overhang attached along a wide face holds (%d of %d voxels)", armA1, armA);
+    CHECK(armB1 < armB / 10, "a long thin arm cannot carry its own weight and breaks (%d of %d left)", armB1, armB);
+    CHECK(blob1 < 100, "a big lump hanging on a thin neck breaks off (%d voxels still up there)", blob1);
+    CHECK(air1 == 0, "a lump with nothing holding it falls");
+    CHECK(g.world.counts[M_DIRT] == total0, "no dirt is lost when things fall (%lld / %d)", g.world.counts[M_DIRT], total0);
+    CHECK(looseDirt(g) == 0, "and it all comes to rest");
+    // dirt lying on the ground stays where it is, however steep
+    fillBox(g, M_DIRT, 150, 169, 1, 30, 150, 169);
+    const int tower0 = countIn(g, M_DIRT, 150, 169, 1, 30, 150, 169);
+    settle(g, 5000);
+    CHECK(countIn(g, M_DIRT, 150, 169, 1, 30, 150, 169) == tower0, "a dirt tower standing on the ground keeps its shape (a vertical 20 x 20 x 30 block)");
+}
+
+void testGrass(Game& g) {
+    tlog("[grass: only on dirt, a two voxel skin, spreads]\n");
+    g.reset();
+    fillBox(g, M_DIRT, 100, 139, 1, 6, 100, 139);     // a dirt slab
+    fillBox(g, M_STONE, 150, 159, 1, 6, 100, 109);    // stone and sand beside it
+    fillBox(g, M_SAND, 170, 179, 1, 6, 100, 109);
+    CHECK(!g.world.paintGrass(155, 6, 105), "grass cannot be put on stone");
+    CHECK(!g.world.paintGrass(175, 6, 105), "grass cannot be put on sand");
+    CHECK(!g.world.paintGrass(120, 20, 120), "grass cannot be put in the air");
+    CHECK(!g.world.paintGrass(120, 3, 120), "grass cannot be put deep inside the dirt (only the 2 voxel skin)");
+    CHECK(g.world.paintGrass(120, 6, 120), "grass goes onto the surface of the dirt");
+    const long long covered0 = g.world.counts[M_DIRT] + g.world.counts[M_GRASS];
+    runSim(g, 12000);  // 100 s of growth
+    int bad = 0, topCols = 0, thick = 0, deepGrass = 0;
+    for (int z = 100; z <= 139; z++)
+        for (int x = 100; x <= 139; x++) {
+            const bool inner = x >= 103 && x <= 136 && z >= 103 && z <= 136;  // (the edge columns are also skinned from the side)
+            int grass = 0;
+            for (int y = 1; y <= 6; y++) {
+                const bool gr = g.world.get(x, y, z) == M_GRASS;
+                grass += gr;
+                if (gr && y < 5 && inner) deepGrass++;
+            }
+            if (inner) thick = std::max(thick, grass);
+            topCols += g.world.get(x, 6, z) == M_GRASS && g.world.get(x, 5, z) == M_GRASS;
+            if (g.world.get(x, 6, z) != M_GRASS) bad++;
+        }
+    tlog("  after 100 s: %d of 1600 columns are fully covered, thickest grass %d voxels, %d uncovered tops\n", topCols, thick, bad);
+    CHECK(thick <= 2, "grass is never more than 2 voxels thick (%d)", thick);
+    CHECK(deepGrass == 0, "and nothing below that skin turns to grass (%d)", deepGrass);
+    CHECK(bad == 0, "it covers all the dirt it can reach (%d tops still bare)", bad);
+    CHECK(g.world.counts[M_DIRT] + g.world.counts[M_GRASS] == covered0, "grass replaces dirt voxel for voxel");
+    CHECK(countIn(g, M_GRASS, 150, 179, 1, 8, 100, 109) == 0, "none of it jumped onto the stone or the sand");
+    // burying grass kills it; grass that falls with its dirt turns back into dirt
+    fillBox(g, M_STONE, 118, 122, 7, 12, 118, 122);
+    runSim(g, 3000);
+    CHECK(g.world.get(120, 6, 120) == M_DIRT && g.world.get(120, 5, 120) == M_DIRT, "grass under a stone dies back to dirt");
+}
+
+void testWadingInWater(Game& g) {
+    tlog("[wading through water]\n");
+    g.reset();
+    const Basin b = buildBasin(g, 80, 70);
+    fillWater(g, b, 20);
+    settle(g, 5000);
+    const long long water0 = g.world.counts[M_WATER];
+    g.player.pos = Vec3((float)cx(), 1.0f, (float)(b.z1 - 30));
+    g.player.vel = Vec3(0, 0, 0);
+    g.player.yaw = 0;
+    GameInput in;
+    in.forward = 1;
+    int leaks = 0, maxGrains = 0;
+    float dist0 = g.player.pos.z;
+    const int frames = 100;
+    float zAtHalf = 0;
+    for (int i = 0; i < frames; i++) {
+        g.update(1.0f / 60.0f, in);
+        if (i >= 4) leaks += waterInsideBox(g);
+        maxGrains = std::max(maxGrains, g.grainsInFlight());
+        if (i == 59) zAtHalf = g.player.pos.z;
+    }
+    const float travelled = dist0 - zAtHalf;  // after 1 s
+    tlog("  walked %.0f voxels in 1 s (dry walking is ~170), droplets in flight peaked at %d, speed at last splash %.0f\n", travelled, maxGrains, g.lastSplashSpeed);
+    CHECK(travelled < 160.0f && travelled > 40.0f, "wading is slower than walking on dry ground (%.0f voxels in 1 s)", travelled);
+    CHECK(leaks == 0, "the player never ends up inside the water (%d water voxel-frames inside the body)", leaks);
+    // stop and let everything run back: the wake behind the player must have closed up
+    runGame(g, 4.0f, GameInput());
+    CHECK(g.grainsInFlight() == 0, "all droplets have landed (%d flying)", g.grainsInFlight());
+    const long long water1 = g.world.counts[M_WATER];
+    CHECK(water1 > water0 * 98 / 100 && water1 <= water0, "water is displaced, not destroyed (%lld -> %lld)", water0, water1);
+    int dry = 0, cells = 0;
+    const int zStart = b.z1 - 30, zNow = floorToInt(g.player.pos.z);
+    for (int z = zNow + 40; z <= zStart; z++)
+        for (int x = cx() - 20; x <= cx() + 20; x++) {
+            cells++;
+            int h = 0;
+            for (int y = 1; y < 40; y++) h += g.world.get(x, y, z) == M_WATER;
+            dry += h < 18;
+        }
+    tlog("  the path behind the player: %d of %d columns are shallower than 18 (level is 20)\n", dry, cells);
+    CHECK(dry * 20 < cells, "water flows back in behind the player (%d of %d columns still hollow)", dry, cells);
+}
+
+void testPlungeIntoWater(Game& g) {
+    tlog("[jumping into water]\n");
+    g.reset();
+    const Basin b = buildBasin(g, 70, 135);
+    fillWater(g, b, 90);
+    settle(g, 5000);
+    const long long water0 = g.world.counts[M_WATER];
+    g.player.pos = Vec3((float)cx(), 150.0f, (float)cz());
+    g.player.vel = Vec3(0, 0, 0);
+    int maxGrains = 0;
+    float peakSplash = 0;
+    for (int i = 0; i < 90; i++) {
+        g.update(1.0f / 60.0f, GameInput());
+        maxGrains = std::max(maxGrains, g.grainsInFlight());
+        peakSplash = std::max(peakSplash, g.lastSplashSpeed);
+    }
+    tlog("  splash: %.0f voxels/s impact, %d droplets in the air at once, player at y=%.1f\n", peakSplash, maxGrains, g.player.pos.y);
+    CHECK(peakSplash > 200.0f, "falling into water registers as a fast impact (%.0f)", peakSplash);
+    CHECK(maxGrains > 100, "a plunge throws up a splash of droplets (%d)", maxGrains);
+    runGame(g, 5.0f, GameInput());
+    tlog("  after 5 s: player y=%.1f (water surface at 90), waterFrac=%.2f\n", g.player.pos.y, g.player.waterFrac);
+    CHECK(g.player.pos.y > 8.0f && g.player.pos.y < 50.0f && g.player.waterFrac > 0.4f, "the player floats with the head above water (feet at y=%.1f)", g.player.pos.y);
+    CHECK(waterInsideBox(g) == 0, "and still pushes the water out of his body");
+    CHECK(g.grainsInFlight() == 0, "the splash has come back down (%d droplets)", g.grainsInFlight());
+    const long long water1 = g.world.counts[M_WATER];
+    CHECK(water1 > water0 * 97 / 100, "almost all the displaced water is still there (%lld -> %lld)", water0, water1);
+}
+
+void testStoneDoesNotSplash(Game& g) {
+    tlog("[stone does not react]\n");
+    g.reset();
+    g.player.pos = Vec3((float)cx(), 1.0f, (float)cz() + 60.0f);
+    GameInput in;
+    in.forward = 1;
+    in.sprint = true;
+    runGame(g, 1.5f, in);
+    CHECK(g.particles.empty(), "running on bedrock throws nothing up (%zu particles)", g.particles.size());
+    // dropping onto bedrock from height: no crater, no splash
+    g.player.pos = Vec3((float)cx(), 200.0f, (float)cz());
+    g.player.vel = Vec3(0, 0, 0);
+    runGame(g, 3.0f, GameInput());
+    CHECK(g.particles.empty(), "landing hard on stone is silent (%zu particles)", g.particles.size());
 }
 
 void testBigPour(Game& g) {
@@ -288,6 +860,42 @@ void testBodyStack(Game& g) {
     CHECK(std::fabs(B->pos.x - A->pos.x) < 1.5f && std::fabs(B->pos.z - A->pos.z) < 1.5f, "stack stays aligned");
 }
 
+void testBodySplash(Game& g) {
+    tlog("[a stone block falling into a pool splashes like the player does]\n");
+    g.reset();
+    g.player.pos = Vec3(20.0f, 1.0f, 20.0f);
+    g.player.vel = Vec3(0, 0, 0);
+    const Basin b = buildBasin(g, 60, 90);
+    fillWater(g, b, 30);
+    settle(g, 5000);
+    const std::vector<uint16_t> map = buildWaterTopMap(g);
+    g.waterField.setSurface(map.data());
+    const long long total = g.world.counts[M_WATER];
+    std::vector<IVec3> cells;
+    addBox(cells, cx() - 6, 75, cz() - 6, 12, 12, 12);
+    Body* body = g.physics.createFromWorldCells(cells);
+    int maxDroplets = 0, maxSpray = 0;
+    float peakRipple = 0, peakSpeed = 0;
+    for (int i = 0; i < 150; i++) {
+        g.update(1.0f / 60.0f, GameInput());
+        maxDroplets = std::max(maxDroplets, waterParticlesInFlight(g));
+        maxSpray = std::max(maxSpray, (int)g.particles.size() - g.grainsInFlight());
+        peakRipple = std::max(peakRipple, g.waterField.peakRipple());
+        peakSpeed = std::max(peakSpeed, g.lastSplashSpeed);
+    }
+    tlog("  12^3 stone block dropped from 44 voxels above the water: impact %.0f voxels/s, %d droplets and %d spray cubes in the air, ripples up to %.2f\n", peakSpeed, maxDroplets, maxSpray, peakRipple);
+    CHECK(peakSpeed > 150.0f, "the block hits the water fast (%.0f voxels/s)", peakSpeed);
+    CHECK(maxDroplets > 20, "and throws up a crown of droplets (%d at once)", maxDroplets);
+    CHECK(peakRipple > 0.05f, "and sets the surface rocking (ripple %.2f)", peakRipple);
+    runGame(g, 5.0f, GameInput());
+    CHECK(waterParticlesInFlight(g) == 0, "the splash comes back down (%d droplets left)", waterParticlesInFlight(g));
+    CHECK(g.world.counts[M_WATER] == total, "the displaced water is not lost (%lld -> %lld, %d could not land)", total, g.world.counts[M_WATER], g.lostGrains);
+    int inside = 0;
+    for (uint32_t i : body->ovCells) inside += (g.world.data[i] & VOX_MASK) == M_WATER ? 1 : 0;
+    CHECK(inside == 0, "no water ends up inside the stone (%d voxels)", inside);
+    CHECK(body->pos.y < 25.0f, "and the block sinks (centre y=%.1f)", body->pos.y);
+}
+
 void testBodyOnSand(Game& g) {
     tlog("[rigid bodies resting on sand]\n");
     g.reset();
@@ -303,8 +911,15 @@ void testBodyOnSand(Game& g) {
     Body* b = g.physics.createFromWorldCells(cells);
     runPhysics(g, 3.0f);
     tlog("  heap top y=%d, body centre y=%.2f\n", top, b->pos.y);
-    CHECK(b->pos.y > (float)top, "stone body comes to rest on top of the sand heap instead of sinking through it");
-    CHECK(b->asleep, "body sleeps on the heap");
+    // The slab may slide off the (steep) heap, but it must never be inside the sand.
+    int inside = 0;
+    const Mat3 R = b->rot.toMat3();
+    for (const Vec3& sv : b->surf) {
+        Vec3 p = b->pos + R * sv;
+        inside += g.world.get(floorToInt(p.x), floorToInt(p.y), floorToInt(p.z)) == M_SAND;
+    }
+    CHECK(inside * 20 < (int)b->surf.size(), "stone body stays outside the sand (%d of %zu voxels overlap)", inside, b->surf.size());
+    CHECK(b->asleep, "body sleeps");
 }
 
 void testBuriedPlayer(Game& g) {
@@ -402,13 +1017,28 @@ int runSelfTest(const char* logPath) {
         testRay(*g);
         testSand(*g);
         testWater(*g);
+        testWaterLevel(*g);
+        testWaterLevelWide(*g);
         testBigPour(*g);
         testPlayer(*g);
         testFreeStone(*g);
         testBodyStack(*g);
         testBodySplit(*g);
         testBodyOnSand(*g);
+        testBodySplash(*g);
         testBuriedPlayer(*g);
+        testSandWading(*g);
+        testSandFootsteps(*g);
+        testSandCrater(*g);
+        testWaterImpact(*g);
+        testWaterField(*g);
+        testWaterSplash(*g);
+        testDirtPile(*g);
+        testDirtStructure(*g);
+        testGrass(*g);
+        testWadingInWater(*g);
+        testPlungeIntoWater(*g);
+        testStoneDoesNotSplash(*g);
         testIslandSplit(*g);
         delete g;
     }

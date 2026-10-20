@@ -1,5 +1,7 @@
 // First-person controller: a 50 x 100 x 50 voxel AABB centred on the camera column (spec section 3).
 #pragma once
+#include <functional>
+
 #include "VoxMath.h"
 #include "World.h"
 
@@ -17,7 +19,11 @@ public:
     float yaw = 0, pitch = 0;
     bool onGround = false;
     bool inWater = false;
+    float waterFrac = 0;  // 0..1: how much of the body is below the water surface
     bool frozen = false;  // scripted camera shots: no gravity / movement
+    // Called when a horizontal move is blocked by a slab of voxels [mn, mx] (inclusive cell box); returns true if
+    // the slab was cleared (sand shoved aside) so the player may keep going.
+    std::function<bool(const IVec3& mn, const IVec3& mx, int axis, int sign)> plowHook;
 
     void respawn();
     void update(World& w, float dt, const PlayerInput& in);
@@ -36,6 +42,8 @@ public:
 
 private:
     bool overlapsSolid(const World& w) const;
+    float sampleWater(const World& w) const;
     float sweepAxis(const World& w, int axis, float d);
+    bool plowEnabled_ = false;
     void moveHorizontal(const World& w, int axis, float d);
 };

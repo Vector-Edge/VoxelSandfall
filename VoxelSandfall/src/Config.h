@@ -25,11 +25,13 @@ constexpr int FLOOR_Z1 = FLOOR_Z0 + ARENA_SIZE;
 constexpr float PLAYER_W = 50.0f;
 constexpr float PLAYER_H = 100.0f;
 constexpr float PLAYER_EYE = 90.0f;  // eye height near the top of the 100-voxel box
+constexpr float PLAYER_CORE = 22.0f; // width of the torso that displaces water / blocks sand (inside the 50-wide box)
 constexpr float WALK_SPEED = 170.0f;
 constexpr float SPRINT_SPEED = 300.0f;
 constexpr float JUMP_SPEED = 290.0f;
 constexpr float GRAVITY = 700.0f;       // voxels / s^2 (1 voxel ~ 1.8 cm)
 constexpr float STEP_HEIGHT = 6.0f;     // auto step-up so the player can climb sand/rubble
+constexpr float PLOW_HEIGHT = 20.0f;    // the player wades through (and shoves aside) loose sand up to this high
 
 // --- Simulation ------------------------------------------------------------------------------
 constexpr float CELL_TICK_HZ = 120.0f;  // falling-sand / fluid automaton rate (voxels fall up to 3 cells per tick)
@@ -37,8 +39,10 @@ constexpr int   CELL_MAX_TICKS = 6;     // per frame
 constexpr float SIM_BUDGET_MS = 7.0f;   // stop ticking once a frame has spent this long (sim slows down, frame does not)
 constexpr float PHYS_HZ = 240.0f;       // rigid body fixed step
 constexpr int   PHYS_MAX_STEPS = 6;
+constexpr float PHYS_BUDGET_MS = 4.0f;  // rigid bodies get at most this long per frame (beyond it they run in slow motion)
 
 // --- Tools ------------------------------------------------------------------------------------
+constexpr int   MAX_PARTICLES = 6000;  // flying grains / droplets / debris
 constexpr int   BRUSH_MIN = 1;
 constexpr int   BRUSH_MAX = 48;
 constexpr int   BRUSH_DEFAULT = 4;

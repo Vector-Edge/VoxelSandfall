@@ -100,6 +100,9 @@
     <ClCompile Include="src\Player.cpp" />
     <ClCompile Include="src\Png.cpp" />
     <ClCompile Include="src\Renderer.cpp" />
+    <ClCompile Include="src\SandFx.cpp" />
+    <ClCompile Include="src\Dirt.cpp" />
+    <ClCompile Include="src\WaterField.cpp" />
     <ClCompile Include="src\SelfTest.cpp" />
     <ClCompile Include="src\Tools.cpp" />
     <ClCompile Include="src\ViewModel.cpp" />
@@ -110,6 +113,7 @@
     <ClInclude Include="src\Game.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\Parallel.h" />
+    <ClInclude Include="src\WaterField.h" />
     <ClInclude Include="src\Profile.h" />
     <ClInclude Include="src\VoxMath.h" />
     <ClInclude Include="src\Mesher.h" />
