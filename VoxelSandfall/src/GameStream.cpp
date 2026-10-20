@@ -82,6 +82,15 @@ void Game::shiftWorld(int dRx, int dRz) {
             i++;
         }
     }
+    for (size_t i = 0; i < fx.size();) {  // flames and smoke move with the window
+        fx[i].pos -= Vec3(dx, 0, dz);
+        if (!insideWindow(fx[i].pos)) {
+            fx[i] = fx.back();
+            fx.pop_back();
+        } else {
+            i++;
+        }
+    }
     waterField.shift((int)dx, (int)dz);
     hollow_.clear();
     pendingShifts.push_back({dRx, dRz});

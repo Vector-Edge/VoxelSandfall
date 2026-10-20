@@ -30,7 +30,7 @@ VoxelSandfall/
 | Mouse | look (click the window to re-capture, `Esc` releases the mouse, `Esc` again quits) |
 | `R` | **Creator tool** — place / attach voxels |
 | `F` | **Gun tool** — AK-style rifle, hitscan, carves voxels (hold LMB for full auto) |
-| `1` `2` `3` `4` `5` `6` (or `Q` / `E`) | Sand · Water · Normal Stone · Permanent Stone · Dirt · Grass |
+| `1`-`9`, `0` (or `Q` / `E`) | Sand · Water · Normal Stone · Permanent Stone · Dirt · Grass · Coal · Fire · Smoke · Oil |
 | Mouse wheel | brush radius (placement size / destruction size) |
 | Left mouse | paint (Creator) / fire (Gun) |
 | `[` `]` / `;` `'` | rotate the sun / raise-lower the sun |
@@ -61,6 +61,32 @@ VoxelSandfall/
 * **Normal Stone** — contiguous stone forms a rigid body (`Physics.cpp`): mass, inertia tensor, gravity, friction, sleeping,
   body-vs-world and body-vs-body collision (sequential-impulse solver with warm starting, one collision sphere per surface voxel).
 * **Permanent Stone** — immovable, indestructible foundation (the bedrock floor is made of it); immune to the gun.
+
+**Coal, oil, fire and smoke** (`FireWorld.cpp`, `GameFire.cpp`, `Fire.h`, `fx.hlsl`; keys `7` coal, `8` fire, `9` smoke, `0` oil):
+* *Coal* is rock that burns. Like stone it is static where it is attached to the ground and becomes rigid bodies when it is cut loose, but
+  coal painted in the air comes down as **pebbles** (the cloud is cut into irregular pieces like crushed rock salt, each one a rigid
+  body that you can walk over, kick or shove). A flame touching coal lights it; burning coal stays on fire for 25 - 70 s and then
+  is gone, voxel by voxel; it lights the coal next to it **a third less eagerly than a flame does** (rate x 2/3), so a fire creeps through a
+  clump instead of flashing over it. Coal that is held up by what burns away comes loose and falls as rigid bodies; burning rocks
+  burn voxel by voxel too and fall apart as they do. Coal with water next to it **cannot catch fire**, and burning coal that water reaches goes out.
+* *Fire* sets things alight: flame particles rise from burning fuel (and from the Creator's brush), throw sparks, glow on what is around
+  them (merged into up to 16 soft lights the shaders add to nearby surfaces), and die as steam in water. It is **drawn by a shader, not
+  as sprites** (`firevol.hlsl`): the CPU only fills a coarse 3D heat field (one texel per 4 voxels: a column of heat above every
+  exposed burning voxel, taller for oil, plus the flames in flight), and every pixel marches a ray through it, eroding the heat with
+  tall noise that scrolls upwards (tongues of flame lick up, split and die) and lighting what is left with a black-body colour ramp. The ray
+  stops at the scene's depth (resolved to one sample per pixel), so rocks and walls hide the flames behind them.
+* *Smoke* rises slowly, drifts on slow currents, spreads out under ceilings and thins away in a few seconds; burning coal makes grey
+  smoke, burning oil black soot, fire meeting water pale steam. The Creator paints puffs of it.
+* *Oil* is a thick liquid: it flows like water but slowly, floats on water (water sinks through it), sand sinks through it, and it is
+  dark and shiny with a rainbow film. Fire **sweeps through it as a wave**: it catches where a flame touches it and runs out through
+  all the connected oil from there, layer by layer (40 - 320 voxels a second, faster for more oil, so any pool is alight in a second or
+  two); two places where fire met the oil are two waves that run into each other, and the fresh front flares up taller than what has
+  been burning for a while. It lights the coal it touches at once; each oil voxel burns for 10 - 30 s and is gone (burning oil does
+  not flow; it drops if what is under it burns away).
+  Oil under water cannot burn; water over burning oil puts it out.
+* Burning voxels are tracked in `World::burning` (they move with the endless-world window and are saved and restored while burning).
+  Smoke and sparks are camera-facing sprites (`Renderer::buildFx`, smoke sorted far to near, lit and fogged per corner). A fire that fills the screen
+  from close by costs about 3-4 ms of GPU (fewer ray steps on the lower quality tiers); nothing is drawn or uploaded when nothing burns.
 
 **Player <-> sand and water** (`SandFx.cpp`) — sand and water react to the player; stone does not (it is rigid). The harder or
 faster you hit the surface, the bigger the reaction. Displaced material is conserved: it is thrown out and lands again as real
@@ -197,6 +223,7 @@ Chunk rebuilds are done in small slices so a big edit (a stone tower) spreads ov
 | `Mesher.*` | greedy chunk meshing (parallel), per-vertex-AO meshing for rigid bodies, occupancy bricks |
 | `Parallel.h`, `Profile.h` | fork-join thread pool, CPU/GPU frame profiler |
 | `Renderer.*`, `ViewModel.*`, `Png.*` | Direct3D 11 renderer, procedural rifle, HUD, screenshots |
+| `FireWorld.cpp`, `GameFire.cpp`, `Fire.h` | coal / oil burning in the grid, flames, smoke and sparks, burning rocks, fire lights |
 | `Stream.cpp`, `GameStream.cpp` | endless world: region window, storage table, region save / load / generation, recentring of the sim, player, bodies |
 | `Config.h` | all tunables (arena size, gravity, speeds, tick rates) |
 

@@ -19,6 +19,8 @@
     <ClCompile Include="src\CellSim.cpp"><Filter>Engine</Filter></ClCompile>
     <ClCompile Include="src\Physics.cpp"><Filter>Engine</Filter></ClCompile>
     <ClCompile Include="src\BodyForces.cpp"><Filter>Engine</Filter></ClCompile>
+    <ClCompile Include="src\FireWorld.cpp"><Filter>Engine</Filter></ClCompile>
+    <ClCompile Include="src\GameFire.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Tools.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Player.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Game.cpp"><Filter>Game</Filter></ClCompile>
@@ -37,6 +39,7 @@
   <ItemGroup>
     <ClInclude Include="src\VoxMath.h"><Filter>Engine</Filter></ClInclude>
     <ClInclude Include="src\Config.h"><Filter>Engine</Filter></ClInclude>
+    <ClInclude Include="src\Fire.h"><Filter>Engine</Filter></ClInclude>
     <ClInclude Include="src\World.h"><Filter>Engine</Filter></ClInclude>
     <ClInclude Include="src\Physics.h"><Filter>Engine</Filter></ClInclude>
     <ClInclude Include="src\Tools.h"><Filter>Game</Filter></ClInclude>

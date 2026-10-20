@@ -11,6 +11,12 @@ const char* materialName(uint8_t m) {
         case M_BEDROCK: return "PERMANENT STONE";
         case M_DIRT: return "DIRT";
         case M_GRASS: return "GRASS (grows on dirt only)";
+        case M_COAL: return "COAL (burns when lit)";
+        case M_BCOAL: return "BURNING COAL";
+        case M_OIL: return "OIL (catches fire at once)";
+        case M_BOIL: return "BURNING OIL";
+        case M_FIRE: return "FIRE (lights coal and oil)";
+        case M_SMOKE: return "SMOKE";
         default: return "AIR";
     }
 }
@@ -131,7 +137,7 @@ SceneHit castScene(const World& w, const Physics& ph, const Vec3& origin, const 
         best.normal = n;
         best.body = const_cast<Body*>(&b);
         best.cell = c;
-        best.material = M_STONE;
+        best.material = b.matAt(c.x, c.y, c.z);
     }
     return best;
 }
@@ -156,7 +162,7 @@ int detachIslands(World& w, Physics& ph, const std::vector<IVec3>& seeds, int* v
     static const int nb[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
 
     for (const IVec3& s : seeds) {
-        if (w.get(s.x, s.y, s.z) != M_STONE) continue;
+        if (!isRigidMat(w.get(s.x, s.y, s.z))) continue;
         const size_t si = w.idx(s.x, s.y, s.z);
         if (testb(anch, si)) continue;
 
@@ -165,7 +171,7 @@ int detachIslands(World& w, Physics& ph, const std::vector<IVec3>& seeds, int* v
         for (int y = s.y; y >= 0; --y) {
             uint8_t m = w.get(s.x, y, s.z);
             if (m == M_BEDROCK) { anchored = true; break; }
-            if (m != M_STONE) break;
+            if (!isRigidMat(m)) break;
             if (y == 0) { anchored = true; break; }
         }
         if (anchored) {
@@ -186,7 +192,7 @@ int detachIslands(World& w, Physics& ph, const std::vector<IVec3>& seeds, int* v
                 size_t ni = w.idx(nx, ny, nz);
                 uint8_t m = w.data[ni] & VOX_MASK;
                 if (m == M_BEDROCK) { anchored = true; break; }
-                if (m != M_STONE) continue;
+                if (!isRigidMat(m)) continue;
                 if (testb(anch, ni)) { anchored = true; break; }
                 if (testb(vis, ni)) continue;
                 setb(vis, ni);
@@ -204,13 +210,16 @@ int detachIslands(World& w, Physics& ph, const std::vector<IVec3>& seeds, int* v
         } else {
             // A complete floating component: detach it into a rigid body.
             std::vector<IVec3> cells = queue;
+            std::vector<uint8_t> mats;
+            mats.reserve(cells.size());
             EditBox eb;
             for (const IVec3& c : cells) {
+                mats.push_back(w.get(c.x, c.y, c.z));
                 w.setRaw(c.x, c.y, c.z, M_AIR);
                 eb.add(c.x, c.y, c.z);
             }
             eb.flush(w);
-            ph.createFromWorldCells(cells);
+            ph.createFromWorldCells(cells, &mats);
             created++;
             if (voxelsMoved) *voxelsMoved += (int)cells.size();
         }
@@ -237,7 +246,7 @@ CarveResult carveSphere(World& w, Physics& ph, const Vec3& c, float r, Rng& rng)
     w.forEachInSphere(c, r, [&](int x, int y, int z) {
         uint8_t m = w.get(x, y, z);
         if (m == M_AIR || m == M_BEDROCK) return;  // Permanent Stone is immune
-        if (m == M_STONE) removedStone.emplace_back(x, y, z);
+        if (isRigidMat(m)) removedStone.emplace_back(x, y, z);
         addDebris(Vec3(x + 0.5f, y + 0.5f, z + 0.5f), m);
         w.setRaw(x, y, z, M_AIR);
         carved.add(x, y, z);
@@ -251,7 +260,7 @@ CarveResult carveSphere(World& w, Physics& ph, const Vec3& c, float r, Rng& rng)
         for (const IVec3& rc : removedStone)
             for (const auto& d : nb) {
                 int nx = rc.x + d[0], ny = rc.y + d[1], nz = rc.z + d[2];
-                if (w.get(nx, ny, nz) == M_STONE) seeds.emplace_back(nx, ny, nz);
+                if (isRigidMat(w.get(nx, ny, nz))) seeds.emplace_back(nx, ny, nz);
             }
         res.islandsCreated += detachIslands(w, ph, seeds, &res.islandVoxels);
     }
@@ -273,7 +282,7 @@ CarveResult carveSphere(World& w, Physics& ph, const Vec3& c, float r, Rng& rng)
                     const Vec3 cc(i + 0.5f, j + 0.5f, k + 0.5f);
                     if (lengthSq(cc - cl) <= r2) {
                         removed++;
-                        addDebris(b.latticeToWorld(cc), M_STONE);
+                        addDebris(b.latticeToWorld(cc), b.matAt(i, j, k));
                     } else {
                         remaining.emplace_back(i, j, k);
                     }
@@ -293,8 +302,52 @@ CarveResult carveSphere(World& w, Physics& ph, const Vec3& c, float r, Rng& rng)
 // ------------------------------------------------------------------------------------------------
 // Creator: paint
 // ------------------------------------------------------------------------------------------------
+// Breaks a cloud of free-floating rock into pebbles, like crushed rock salt: space is cut into jittered cubes, every voxel goes to
+// the piece whose seed is nearest, and each connected piece becomes its own rigid body.
+static int makePebbles(Physics& ph, const std::vector<IVec3>& comp, uint8_t mat) {
+    const float s = std::max(5.0f, 5.0f * std::cbrt((float)comp.size() / 20000.0f));  // piece size (more voxels -> bigger pieces)
+    auto hash3 = [](int a, int b, int c, int salt) {
+        uint32_t h = (uint32_t)a * 73856093u ^ (uint32_t)b * 19349663u ^ (uint32_t)c * 83492791u ^ (uint32_t)salt * 2654435761u;
+        h ^= h >> 13;
+        h *= 0x5bd1e995u;
+        h ^= h >> 15;
+        return (float)(h & 0xFFFFu) / 65535.0f;
+    };
+    std::unordered_map<uint64_t, std::vector<IVec3>> groups;
+    for (const IVec3& q : comp) {
+        const Vec3 p((float)q.x + 0.5f, (float)q.y + 0.5f, (float)q.z + 0.5f);
+        const int cx = (int)std::floor(p.x / s), cy = (int)std::floor(p.y / s), cz = (int)std::floor(p.z / s);
+        float best = 1e30f;
+        uint64_t key = 0;
+        for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    const int ax = cx + dx, ay = cy + dy, az = cz + dz;
+                    const Vec3 sp(((float)ax + 0.15f + 0.7f * hash3(ax, ay, az, 1)) * s, ((float)ay + 0.15f + 0.7f * hash3(ax, ay, az, 2)) * s,
+                                  ((float)az + 0.15f + 0.7f * hash3(ax, ay, az, 3)) * s);
+                    const float d = lengthSq(p - sp);
+                    if (d < best) {
+                        best = d;
+                        key = ((uint64_t)(uint32_t)(ax + (1 << 20)) << 42) | ((uint64_t)(uint32_t)(ay + (1 << 20)) << 21) | (uint64_t)(uint32_t)(az + (1 << 20));
+                    }
+                }
+        groups[key].push_back(q);
+    }
+    int made = 0;
+    std::vector<std::vector<IVec3>> pieces;
+    for (auto& kv : groups) {
+        Physics::connectedComponents(kv.second, pieces);
+        for (auto& piece : pieces) {
+            ph.createFromWorldCells(piece, nullptr, mat);
+            made++;
+        }
+    }
+    return made;
+}
+
 PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t mat, const Vec3& pmin, const Vec3& pmax) {
     PaintResult res;
+    if (mat == M_FIRE || mat == M_SMOKE) return res;  // particles, not voxels: the game spawns them
     std::vector<IVec3> cells;
     EditBox placed;
 
@@ -309,14 +362,14 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
             }
             return;
         }
-        if (mat == M_SAND || mat == M_WATER || mat == M_DIRT) {
+        if (mat == M_SAND || mat == M_WATER || mat == M_DIRT || mat == M_OIL) {
             if (cur != M_AIR) return;
-        } else if (cur == M_STONE || cur == M_BEDROCK) {
+        } else if (isRigidMat(cur) || cur == M_BEDROCK) {
             return;  // solids only replace empty space and loose material
         }
-        if (mat != M_WATER && x + 1 > pmin.x && x < pmax.x && y + 1 > pmin.y && y < pmax.y && z + 1 > pmin.z && z < pmax.z)
+        if (!isLiquid(mat) && x + 1 > pmin.x && x < pmax.x && y + 1 > pmin.y && y < pmax.y && z + 1 > pmin.z && z < pmax.z)
             return;  // never entomb the player
-        if (mat == M_STONE) {
+        if (isRigidMat(mat)) {
             cells.emplace_back(x, y, z);
         } else if (mat == M_DIRT) {  // poured dirt falls, settles, and then holds its shape
             w.setLooseDirt(x, y, z);
@@ -329,7 +382,7 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
         }
     });
     placed.flush(w);
-    if (mat != M_STONE) {
+    if (!isRigidMat(mat)) {
         if (mat == M_BEDROCK) ph.wakeNear(c, r + 24.0f);
         return res;
     }
@@ -359,7 +412,7 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
         bool touch = q.y == 0;
         for (const auto& d : nb) {
             uint8_t m = w.get(q.x + d[0], q.y + d[1], q.z + d[2]);
-            if (m == M_STONE || m == M_BEDROCK) touch = true;
+            if (isRigidMat(m) || m == M_BEDROCK) touch = true;
         }
         if (touch && !seen[i]) {
             seen[i] = 1;
@@ -381,7 +434,7 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
     EditBox anchoredBox;
     for (int qi : queue) {
         const IVec3& q = cells[qi];
-        w.setRaw(q.x, q.y, q.z, M_STONE);
+        w.setRaw(q.x, q.y, q.z, mat);
         anchoredBox.add(q.x, q.y, q.z);
         res.staticStone++;
         res.placed++;
@@ -410,6 +463,10 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
         }
         res.placed += (int)comp.size();
 
+        if (mat == M_COAL) {  // coal comes down as pebbles, each one a rigid body
+            res.newBodies += makePebbles(ph, comp, mat);
+            continue;
+        }
         Body* target = nullptr;
         for (auto& up : ph.bodies) {
             Body& b = *up;
@@ -430,10 +487,10 @@ PaintResult paintSphere(World& w, Physics& ph, const Vec3& c, float r, uint8_t m
                 Vec3 l = target->worldToLattice(Vec3(q.x + 0.5f, q.y + 0.5f, q.z + 0.5f));
                 all.emplace_back(floorToInt(l.x), floorToInt(l.y), floorToInt(l.z));
             }
-            ph.setBodyCells(*target, all);
+            ph.setBodyCells(*target, all, mat);
             res.mergedIntoBody += (int)comp.size();
         } else {
-            ph.createFromWorldCells(comp);
+            ph.createFromWorldCells(comp, nullptr, mat);
             res.newBodies++;
         }
     }

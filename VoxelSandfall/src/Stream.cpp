@@ -46,7 +46,7 @@ bool chunkIsInert(const uint8_t* p) {
         if (v == 0 || v == kAllBedrock) continue;
         for (int k = 0; k < 8; k++) {
             const uint8_t m = (uint8_t)(v >> (8 * k)) & VOX_MASK;
-            if (m == M_SAND || m == M_WATER || m == M_DIRT || m == M_GRASS) return false;
+            if (isCellular(m) || m == M_BCOAL || m == M_BOIL) return false;
         }
     }
     return true;
@@ -78,7 +78,7 @@ void World::regionCounts(int rxl, int rzl, long long sign) {
                 }
             }
         }
-    for (int m = 0; m < 8; m++) counts[m] += sign * hist[m];
+    for (int m = 0; m < 16; m++) counts[m] += sign * hist[m];
 }
 
 // What a freshly generated region adds to the voxel counts (its storage holds nothing but the floor).
@@ -171,14 +171,18 @@ void World::wakeRegion(int rxl, int rzl) {
                         for (int x = 0; x < 32; x++) {
                             const uint8_t b = c[(z << 10) + (y << 5) + x];
                             const uint8_t m = b & VOX_MASK;
-                            if (m == M_AIR || m == M_STONE || m == M_BEDROCK) continue;
+                            if (m == M_AIR || m == M_STONE || m == M_BEDROCK || m == M_COAL) continue;
                             const int gx = cxl * 32 + x, gy = cy * 32 + y, gz = czl * 32 + z;
+                            if (m == M_BCOAL || m == M_BOIL) {  // it was saved while burning: it carries on
+                                registerBurning(gx, gy, gz, -1.0f);
+                                continue;
+                            }
                             if (m == M_GRASS) {
                                 data[idx(gx, gy, gz)] |= VOX_GACT;
                                 grassActive.push_back(packCell(gx, gy, gz));
                                 continue;
                             }
-                            if (m == M_SAND || m == M_WATER || m == M_DIRT) {
+                            if (m == M_SAND || m == M_WATER || m == M_DIRT || m == M_OIL) {
                                 if (get(gx + 1, gy, gz) == M_AIR || get(gx - 1, gy, gz) == M_AIR || get(gx, gy + 1, gz) == M_AIR ||
                                     get(gx, gy - 1, gz) == M_AIR || get(gx, gy, gz + 1) == M_AIR || get(gx, gy, gz - 1) == M_AIR)
                                     queueCell(gx, gy, gz);
@@ -213,7 +217,7 @@ void World::wakeSeam(int rxl, int rzl, int side) {  // side: 0 = -x, 1 = +x, 2 =
                     }
                     const int y = cy * 32 + yy;
                     const uint8_t m = get(x, y, z);
-                    if (m == M_SAND || m == M_WATER || m == M_DIRT) queueCell(x, y, z);
+                    if (m == M_SAND || m == M_WATER || m == M_DIRT || m == M_OIL) queueCell(x, y, z);
                 }
         }
 }
@@ -233,6 +237,9 @@ void World::initStreaming() {
     dirtQueue.clear();
     dirtHead = 0;
     grassActive.clear();
+    burning.clear();
+    burnCursor = 0;
+    oilFront.clear();
     grassCursor = 0;
     splashes.clear();
     for (auto& c : counts) c = 0;
@@ -373,6 +380,29 @@ World::ShiftResult World::shiftWindow(int dRx, int dRz) {
             if ((unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) keep.push_back(packCell(x, y, z));
         }
         grassActive.swap(keep);
+        // burning coal / oil moves with the window (what left it was saved as burning)
+        {
+            std::vector<BurnCell> kept;
+            kept.reserve(keep.size());
+            for (const BurnCell& b : burning) {
+                int x, y, z;
+                unpackCell(b.cell, x, y, z);
+                x -= dx;
+                z -= dz;
+                if ((unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) kept.push_back({packCell(x, y, z), b.left, b.age});
+            }
+            burning.swap(kept);
+            burnCursor = 0;
+            std::vector<uint32_t> front;  // (the wave front too)
+            for (uint32_t c : oilFront) {
+                int x, y, z;
+                unpackCell(c, x, y, z);
+                x -= dx;
+                z -= dz;
+                if ((unsigned)x < (unsigned)SX && (unsigned)z < (unsigned)SZ) front.push_back(packCell(x, y, z));
+            }
+            oilFront.swap(front);
+        }
         grassCursor = 0;
     }
     for (SimWorker& w : simWorkers) {

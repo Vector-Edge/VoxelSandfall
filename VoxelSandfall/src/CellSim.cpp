@@ -1,6 +1,8 @@
-﻿// Cellular automata for the two particle materials (spec section 1):
+﻿// Cellular automata for the particle materials (spec section 1):
 //   Sand  - falls straight down; if blocked, slides diagonally (down-left/right/forward/back).
 //   Water - falls straight down; if blocked, spreads laterally into adjacent empty cells.
+//   Oil   - a thick liquid: it flows like water but slowly (it hops and squeezes sideways only now and then, and only looks
+//           a short way for a lower surface), it floats on water (water sinks through it) and sand sinks through it.
 // Only voxels on the active lists are visited, so a settled world costs nothing.
 //
 // Parallelism: the grid is cut into 8x8 voxel columns ("tiles", full height). Tiles of the same
@@ -32,6 +34,9 @@ constexpr int kLineDZ[8] = {0, 0, 1, -1, 1, -1, 1, -1};
 constexpr int kWaterReach = 128;  // how far a surface water voxel looks for a lower surface (through other water)
 constexpr int kHopPercent = 55;   // chance per tick that an unstable surface voxel actually hops (flow speed)
 constexpr int kMaxHopsPerTick = 40000;
+constexpr int kOilReach = 36;         // how far a surface oil voxel looks for a lower surface
+constexpr int kOilHopPercent = 16;    // chance per tick that an unstable surface oil voxel hops (water: kHopPercent)
+constexpr int kOilMovePercent = 34;   // chance per tick that oil squeezes sideways under pressure
 constexpr int kMaxFall = 3;     // cells a free-falling voxel drops per tick
 constexpr int kMaxImpactsPerTick = 3000;  // soaks per tick (the serial pass); water beyond that just lands and flows
 constexpr size_t kMaxSplashEvents = 12000;
@@ -133,13 +138,14 @@ int World::applyWaterHops(int maxHops) {
             unpackCell((uint32_t)(h >> 32), sx, sy, sz);
             unpackCell((uint32_t)(h & 0xFFFFFFFFu), dx, dy, dz);
             const size_t si = idx(sx, sy, sz);
-            if ((data[si] & VOX_MASK) != M_WATER || applied >= maxHops || !cellFree(dx, dy, dz) || !cellFree(dx, dy - 1, dz)) {
+            const uint8_t liquid = data[si] & VOX_MASK;
+            if ((liquid != M_WATER && liquid != M_OIL) || applied >= maxHops || !cellFree(dx, dy, dz) || !cellFree(dx, dy - 1, dz)) {
                 queueCell(sx, sy, sz);  // try again next tick
                 continue;
             }
             while (cellFree(dx, dy - 1, dz)) dy--;  // land on the surface straight away
             const size_t di = idx(dx, dy, dz);
-            data[di] = M_WATER;
+            data[di] = liquid;
             data[si] = 0;
             markDirtyWater(sx, sy, sz);
             markDirtyWater(dx, dy, dz);
@@ -336,7 +342,7 @@ void World::simTile(int tile, SimWorker& sw) {
         data[si] = tm ? (uint8_t)(tm | VOX_MOVED) : (uint8_t)0;
         sw.moved.push_back((uint32_t)ti);
         if (tm) sw.moved.push_back((uint32_t)si);
-        if ((sm & VOX_MASK) == M_WATER && tm == M_AIR) {
+        if (isLiquid(sm & VOX_MASK) && (tm == M_AIR || isLiquid(tm))) {
             markDirtyWater(x, y, z);
             markDirtyWater(nx, ny, nz);
         } else {
@@ -377,7 +383,7 @@ void World::simTile(int tile, SimWorker& sw) {
                 }
                 if (inBounds(x, y - 1, z)) {  // sand sinks through water (swap)
                     size_t bi = idx(x, y - 1, z);
-                    if ((data[bi] & VOX_MASK) == M_WATER && !(data[bi] & VOX_MOVED) && (!overlayActive || overlay[bi] == 0)) {
+                    if (((data[bi] & VOX_MASK) == M_WATER || (data[bi] & VOX_MASK) == M_OIL) && !(data[bi] & VOX_MOVED) && (!overlayActive || overlay[bi] == 0)) {
                         moveTo(x, y, z, x, y - 1, z, -1);
                         continue;
                     }
@@ -402,7 +408,7 @@ void World::simTile(int tile, SimWorker& sw) {
                         int held = 0;
                         for (int e = 0; e < 4; e++) {
                             const uint8_t nm = get(x + kDX[e], y, z + kDZ[e]);
-                            held += (nm == M_SAND || nm >= M_STONE);
+                            held += isOpaque(nm);
                         }
                         if (held >= 3) need++;
                     }
@@ -426,7 +432,7 @@ void World::simTile(int tile, SimWorker& sw) {
                     // able to spread again, and a voxel with nothing under it may be hanging (-> structure analysis).
                     if (m == M_GRASS && !(v & VOX_GACT)) sw.grassSeeds.push_back(c);
                     const uint8_t bm = get(x, y - 1, z);
-                    if (bm == M_AIR || bm == M_WATER) sw.dirtSeeds.push_back(c);
+                    if (bm == M_AIR || isLiquid(bm)) sw.dirtSeeds.push_back(c);
                     continue;
                 }
                 // Loose dirt falls like sand, sinks through water, and slides only off steep drops: it is much clumpier
@@ -438,7 +444,7 @@ void World::simTile(int tile, SimWorker& sw) {
                 }
                 if (inBounds(x, y - 1, z)) {
                     size_t bi = idx(x, y - 1, z);
-                    if ((data[bi] & VOX_MASK) == M_WATER && !(data[bi] & VOX_MOVED) && (!overlayActive || overlay[bi] == 0)) {
+                    if (((data[bi] & VOX_MASK) == M_WATER || (data[bi] & VOX_MASK) == M_OIL) && !(data[bi] & VOX_MOVED) && (!overlayActive || overlay[bi] == 0)) {
                         moveTo(x, y, z, x, y - 1, z, -1);
                         continue;
                     }
@@ -456,7 +462,7 @@ void World::simTile(int tile, SimWorker& sw) {
                         int held = 0;
                         for (int e = 0; e < 4; e++) {
                             const uint8_t nm = get(x + kDX[e], y, z + kDZ[e]);
-                            held += (nm == M_SAND || nm >= M_STONE);
+                            held += isOpaque(nm);
                         }
                         if (held >= 3) need++;
                     }
@@ -474,9 +480,10 @@ void World::simTile(int tile, SimWorker& sw) {
                 } else {
                     data[i] &= (uint8_t)~VOX_LOOSE;  // at rest: static from now on
                     const uint8_t bm = get(x, y - 1, z);
-                    if (bm != M_SAND && bm != M_STONE && bm != M_BEDROCK && y > 0) sw.dirtSeeds.push_back(c);  // (it may now load an overhang)
+                    if (bm != M_SAND && !isRigidMat(bm) && bm != M_BEDROCK && y > 0) sw.dirtSeeds.push_back(c);  // (it may now load an overhang)
                 }
-            } else if (m == M_WATER) {
+            } else if (m == M_WATER || m == M_OIL) {
+                const bool oil = m == M_OIL;
                 const int fall = (v & VOX_ENERGY) >> VOX_ENERGY_SHIFT;  // consecutive ticks spent free-falling (max 3)
                 int ny = fallTarget(x, y, z);
                 if (ny != y) {
@@ -486,24 +493,31 @@ void World::simTile(int tile, SimWorker& sw) {
                 if (fall) {  // it has just landed
                     data[i] &= (uint8_t)~VOX_ENERGY;
                     // (water pouring into the hollow around the player is not a splash: the player's own splash handles that)
-                    if (fall >= 2 && impactsEnabled &&
+                    if (!oil && fall >= 2 && impactsEnabled &&
                         !(boxOn && x >= boxMin[0] - 8 && x <= boxMax[0] + 8 && z >= boxMin[2] - 8 && z <= boxMax[2] + 8)) {
                         sw.impacts.push_back(packCell(x, y, z) | ((uint32_t)fall << 27));
                         if (soakEnabled && get(x, y - 1, z) == M_WATER) continue;  // on a pool: the serial pass soaks it in
+                    }
+                }
+                if (!oil && inBounds(x, y - 1, z)) {  // water sinks through oil (oil floats on it)
+                    const size_t bi = idx(x, y - 1, z);
+                    if ((data[bi] & VOX_MASK) == M_OIL && !(data[bi] & VOX_MOVED) && (!overlayActive || overlay[bi] == 0)) {
+                        moveTo(x, y, z, x, y - 1, z, 0);
+                        continue;
                     }
                 }
                 const bool top = cellFree(x, y + 1, z);
                 // 1) Level the surface: look along the four axes, straight through other water, for a column
                 //    at least two lower than this one, and hop to it.
                 if (top) {
-                    int bestK = kWaterReach, best[8], nb = 0;
+                    int bestK = oil ? kOilReach : kWaterReach, best[8], nb = 0;
                     for (int d = 0; d < 8; d++) {
                         for (int kk = 1; kk <= bestK; kk++) {
                             const int nx = x + kLineDX[d] * kk, nz = z + kLineDZ[d] * kk;
                             if (!inBounds(nx, y, nz)) break;
                             const size_t ci = idx(nx, y, nz);
                             const uint8_t mm = data[ci] & VOX_MASK;
-                            if (mm == M_WATER) continue;      // flows through other water
+                            if (mm == m) continue;            // flows through more of itself
                             if (mm != M_AIR) break;            // wall / sand
                             if ((overlayActive && overlay[ci]) || (boxOn && inPlayerBox(nx, y, nz))) break;
                             if (cellFree(nx, y - 1, nz)) {     // the column there is lower by >= 2
@@ -515,7 +529,7 @@ void World::simTile(int tile, SimWorker& sw) {
                         }
                     }
                     if (nb) {
-                        if (rng.below(100) < kHopPercent) {
+                        if ((int)rng.below(100) < (oil ? kOilHopPercent : kHopPercent)) {
                             const int d = best[rng.below(nb)];
                             const uint32_t src = packCell(x, y, z), dst = packCell(x + kLineDX[d] * bestK, y, z + kLineDZ[d] * bestK);
                             sw.hops.push_back(((uint64_t)src << 32) | dst);
@@ -531,6 +545,10 @@ void World::simTile(int tile, SimWorker& sw) {
                 for (int dd = 0; dd < 4; dd++)
                     if (cellFree(x + kDX[dd], y, z + kDZ[dd])) cand[n++] = dd;
                 if (n && isCellular(get(x, y + 1, z))) {
+                    if (oil && (int)rng.below(100) >= kOilMovePercent) {  // thick: it creeps
+                        qLocal(x, y, z);
+                        continue;
+                    }
                     const int dd = cand[rng.below(n)];
                     moveTo(x, y, z, x + kDX[dd], y, z + kDZ[dd], 0);
                 } else if (n && top && rng.below(24) == 0) {

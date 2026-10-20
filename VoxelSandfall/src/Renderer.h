@@ -106,6 +106,10 @@ private:
     void resetChunkGpu();
     void drawBodies(const Game& g);
     void drawParticles();
+    void buildFx(const Game& g);  // sparks and smoke as camera-facing sprites (smoke sorted back to front)
+    void drawFx();
+    void buildFireHeat(const Game& g);  // the flames' heat field (what firevol.hlsl turns into fire)
+    void drawFireVolume();
     void drawBrush(const Game& g);
     void drawViewModel(const Game& g);
     void drawHud(const Game& g);
@@ -144,15 +148,16 @@ private:
     ComPtr<ID3D11ShaderResourceView> waterFieldSRV_;
 
     // shaders
-    ComPtr<ID3D11VertexShader> vsShadow_, vsWorld_, vsSky_, vsLine_, vsUI_, vsView_;
-    ComPtr<ID3D11PixelShader> psWorld_, psWater_, psUnder_, psBlit_, psSky_, psLine_, psUI_, psView_, psFlash_;
-    ComPtr<ID3D11InputLayout> layWorld_, layLine_, layUI_, layView_;
+    ComPtr<ID3D11VertexShader> vsShadow_, vsWorld_, vsSky_, vsLine_, vsUI_, vsView_, vsFx_;
+    ComPtr<ID3D11PixelShader> psWorld_, psWater_, psUnder_, psBlit_, psSky_, psLine_, psUI_, psView_, psFlash_, psFire_, psSmoke_,
+        psFireVol_, psDepthMS_, psDepth1_;
+    ComPtr<ID3D11InputLayout> layWorld_, layLine_, layUI_, layView_, layFx_;
 
     // states
     ComPtr<ID3D11RasterizerState> rsSolid_, rsShadow_, rsNoCull_;
     ComPtr<ID3D11DepthStencilState> dsLess_, dsLessNoWrite_, dsOff_, dsEqual_, dsSky_;
-    ComPtr<ID3D11BlendState> bsOpaque_, bsAlpha_, bsAdd_, bsWater_;
-    ComPtr<ID3D11SamplerState> sampShadow_, sampLinear_;
+    ComPtr<ID3D11BlendState> bsOpaque_, bsAlpha_, bsAdd_, bsWater_, bsFire_;
+    ComPtr<ID3D11SamplerState> sampShadow_, sampLinear_, sampWrap_;
 
     // constant buffers
     ComPtr<ID3D11Buffer> cbFrame_, cbObject_, cbUI_, cbVM_;
@@ -167,6 +172,32 @@ private:
     UINT lineCap_ = 0, uiCap_ = 0;
     ComPtr<ID3D11Buffer> partVB_, partIB_;
     UINT partIndexCount_ = 0, partVBCap_ = 0, partIBCap_ = 0;
+    struct FxInst {  // per-instance data of one flame / smoke sprite (matches fx.hlsl)
+        float x, y, z, halfSize;
+        uint32_t col;   // rgba8
+        float rot, kind;
+        uint32_t pad;
+    };
+    // fire volume: a coarse 3D heat texture over the whole window (one texel per kHeatCell voxels), rebuilt on the CPU every frame
+    static constexpr int kHeatCell = 4;
+    static constexpr int kHX = cfg::WORLD_X / kHeatCell, kHY = cfg::WORLD_Y / kHeatCell, kHZ = cfg::WORLD_Z / kHeatCell;
+    ComPtr<ID3D11Texture3D> heatTex_, noiseTex_;
+    ComPtr<ID3D11ShaderResourceView> heatSRV_, noiseSRV_;
+    ComPtr<ID3D11Texture2D> fireDepthTex_;      // the scene's depth, one sample per pixel
+    ComPtr<ID3D11RenderTargetView> fireDepthRTV_;
+    ComPtr<ID3D11ShaderResourceView> fireDepthSRV_, msaaDepthSRV_;
+    std::vector<uint8_t> heat_;
+    int heatMin_[3] = {1 << 20, 1 << 20, 1 << 20}, heatMax_[3] = {-1, -1, -1};  // texels written last frame (they are cleared first)
+    std::vector<float> colStr_, colY_;
+    std::vector<uint32_t> colStamp_;
+    std::vector<int> colList_;
+    uint32_t heatStamp_ = 0;
+    bool fireActive_ = false;
+    Vec3 fireBoxMin_, fireBoxMax_;
+    ComPtr<ID3D11Buffer> fxVB_;
+    UINT fxCap_ = 0;                  // instances the buffer holds
+    std::vector<FxInst> fxInst_;      // smoke first (sorted far to near), then flames and sparks
+    UINT fxSmoke_ = 0, fxFire_ = 0;
     ComPtr<ID3D11Buffer> rifleVB_, rifleIB_;
     ViewModelMesh rifle_;
 

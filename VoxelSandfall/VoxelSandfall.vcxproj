@@ -98,6 +98,8 @@
     <ClCompile Include="src\Mesher.cpp" />
     <ClCompile Include="src\Physics.cpp" />
     <ClCompile Include="src\BodyForces.cpp" />
+    <ClCompile Include="src\FireWorld.cpp" />
+    <ClCompile Include="src\GameFire.cpp" />
     <ClCompile Include="src\Player.cpp" />
     <ClCompile Include="src\Png.cpp" />
     <ClCompile Include="src\Renderer.cpp" />
@@ -113,6 +115,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Config.h" />
+    <ClInclude Include="src\Fire.h" />
     <ClInclude Include="src\Game.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\Parallel.h" />

@@ -28,7 +28,7 @@ void meshPadded(const uint8_t* pad, int nx, int ny, int nz, const Vec3& origin, 
                 const uint8_t m = at(x, y, z);
                 if (m == M_AIR) continue;
                 const bool solid = isOpaque(m);
-                if (!solid && !(water && m == M_WATER)) continue;
+                if (!solid && !(water && isLiquid(m))) continue;
                 for (int f = 0; f < 6; f++) {
                     const FaceDef& fd = kFaces[f];
                     const uint8_t nb = at(x + fd.n[0], y + fd.n[1], z + fd.n[2]);
@@ -58,7 +58,7 @@ void meshPadded(const uint8_t* pad, int nx, int ny, int nz, const Vec3& origin, 
                         mv.x = origin.x + x + fd.o[0] + fd.u[0] * a + fd.v[0] * b;
                         mv.y = origin.y + y + fd.o[1] + fd.u[1] * a + fd.v[1] * b;
                         mv.z = origin.z + z + fd.o[2] + fd.u[2] * a + fd.v[2] * b;
-                        mv.attr = (uint32_t)f | ((uint32_t)(m & 7) << 3) | ((uint32_t)ao[q] << 6);
+                        mv.attr = (uint32_t)f | ((uint32_t)(m & 15) << 3) | ((uint32_t)ao[q] << 7);
                         md.verts.push_back(mv);
                     }
                     // Split the quad along the diagonal joining the two brighter corners (avoids AO anisotropy).
@@ -109,7 +109,7 @@ void greedyFaces(const uint8_t* pad, int N, int yLo, int yHi, const Vec3& origin
                     if (m != M_AIR) {
                         int nb[3] = {c[0] + fd.n[0], c[1] + fd.n[1], c[2] + fd.n[2]};
                         const uint8_t t = at(nb);
-                        if (water) val = (m == M_WATER && t == M_AIR) ? (uint8_t)M_WATER : (uint8_t)0;
+                        if (water) val = (isLiquid(m) && t == M_AIR) ? m : (uint8_t)0;
                         else val = (isOpaque(m) && !isOpaque(t)) ? m : (uint8_t)0;
                     }
                     mask[v * N + u] = val;
@@ -137,7 +137,7 @@ void greedyFaces(const uint8_t* pad, int N, int yLo, int yHi, const Vec3& origin
                     base[aU] = (float)u0;
                     base[aV] = (float)v0;
                     const uint32_t first = (uint32_t)out.verts.size();
-                    const uint32_t attr = (uint32_t)f | ((uint32_t)(val & 7) << 3) | (3u << 6);
+                    const uint32_t attr = (uint32_t)f | ((uint32_t)(val & 15) << 3) | (3u << 7);
                     for (int q = 0; q < 4; q++) {
                         const bool ua = (q == 1 || q == 2), vb = (q >= 2);
                         float p3[3] = {base[0], base[1], base[2]};
@@ -248,7 +248,7 @@ void computeBricks(const World& w, int chunkIndex, uint8_t out[64]) {
                 uint8_t occupied = 0;
                 for (int x = 0; x < 8; x++) {
                     uint8_t m = row[b * 8 + x] & VOX_MASK;
-                    occupied |= (m == M_SAND || m >= M_STONE);
+                    occupied |= isOpaque(m) ? 1 : 0;
                 }
                 o[b] |= occupied;
             }
@@ -263,7 +263,8 @@ void buildBodyMesh(const Body& b, MeshData& opaque) {
     for (int k = 0; k < b.nz; k++)
         for (int j = 0; j < b.ny; j++)
             for (int i = 0; i < b.nx; i++)
-                if (b.occupiedAt(i, j, k)) pad[(size_t)(i + 1) + (size_t)P0 * ((size_t)(j + 1) + (size_t)P1 * (size_t)(k + 1))] = M_STONE;
+                if (b.occupiedAt(i, j, k))
+                    pad[(size_t)(i + 1) + (size_t)P0 * ((size_t)(j + 1) + (size_t)P1 * (size_t)(k + 1))] = b.occ[(size_t)i + (size_t)b.nx * ((size_t)j + (size_t)b.ny * (size_t)k)];
     meshPadded(pad.data(), b.nx, b.ny, b.nz, Vec3(0, 0, 0), opaque, nullptr);
 }
 
@@ -280,7 +281,7 @@ void appendCube(MeshData& m, const Vec3& c, float size, uint8_t material) {
             mv.x = c.x + ((fd.o[0] + fd.u[0] * a + fd.v[0] * b) ? h : -h);
             mv.y = c.y + ((fd.o[1] + fd.u[1] * a + fd.v[1] * b) ? h : -h);
             mv.z = c.z + ((fd.o[2] + fd.u[2] * a + fd.v[2] * b) ? h : -h);
-            mv.attr = (uint32_t)f | ((uint32_t)(material & 7) << 3) | (3u << 6);
+            mv.attr = (uint32_t)f | ((uint32_t)(material & 15) << 3) | (3u << 7);
             m.verts.push_back(mv);
         }
         const uint32_t t[6] = {0, 1, 2, 0, 2, 3};

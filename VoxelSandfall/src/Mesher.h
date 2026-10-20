@@ -6,7 +6,7 @@
 #include "VoxMath.h"
 #include "World.h"
 
-// Vertex layout (matches the ATTR input in world.hlsl): attr bits 0-2 face, 3-5 material, 6-7 AO.
+// Vertex layout (matches the ATTR input in world.hlsl): attr bits 0-2 face, 3-6 material, 7-8 AO.
 struct MeshVertex {
     float x, y, z;
     uint32_t attr;

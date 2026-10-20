@@ -180,7 +180,7 @@ int Game::digSand(float cx, float cz, float radius, float depth, int hintY, F&& 
             for (int y = hintY + 2; y >= std::max(0, hintY - 10); --y) {
                 const uint8_t m = world.get(x, y, z);
                 if (m == M_SAND) { top = y; break; }
-                if (m >= M_STONE) break;
+                if (isOpaque(m)) break;
             }
             if (top < 0) continue;
             const float d = depth * (1.0f - r2);

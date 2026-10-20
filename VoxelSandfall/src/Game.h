@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "Config.h"
+#include "Fire.h"
 #include "VoxMath.h"
 #include "Physics.h"
 #include "Player.h"
@@ -21,7 +22,7 @@ struct GameInput {
     int wheel = 0;                 // scroll notches (+ = up)
     bool selectCreator = false;    // R
     bool selectGun = false;        // F
-    int selectMaterial = 0;        // 1..6
+    int selectMaterial = 0;        // 1..10 (the 0 key is 10)
     int cycleMaterial = 0;         // -1 / +1
 };
 
@@ -90,6 +91,16 @@ public:
 
     uint8_t currentMaterial() const { return kPaintMaterials[materialIndex]; }
 
+    // ---- fire, smoke (GameFire.cpp) -------------------------------------------------------------------
+    std::vector<FxParticle> fx;         // flames, sparks and smoke
+    std::vector<FireLight> fireLights;  // the flames merged into a few glows (rebuilt every frame; the renderer gives them to the shaders)
+    void spawnFlames(const Vec3& centre, float radius, int count, float strength = 1.0f);  // the Creator's fire
+    void spawnSmokeCloud(const Vec3& centre, float radius, int count, uint8_t kind = FX_SMOKE);
+    // Sets the coal / oil at that cell alight (oil: all of it); also a coal rock that has a voxel there. False if nothing can burn.
+    bool igniteAt(int x, int y, int z);
+    size_t flameCount() const;
+    size_t smokeCount() const;
+
     // Tool actions (also used by the scripted test driver).
     PaintResult paintAtCrosshair();
     CarveResult fireAtCrosshair();
@@ -133,6 +144,21 @@ private:
     int digSand(float cx, float cz, float radius, float depth, int hintY, F&& onRemoved);
     void spawnDebris(const CarveResult& r);
     void updateParticles(float dt);
+
+    // fire
+    void updateFire(float dt);
+    void fireStep(float sdt);
+    void burnBodies(float sdt);
+    void emitFromFires(float dt);
+    void updateFx(float dt);
+    void updateFireLights();
+    void spawnFlame(const Vec3& p, float strength, float calm = 1.0f);  // calm < 1: a flame that lingers (the Creator's fire)
+    void spawnSmoke(const Vec3& p, uint8_t kind, float scale);
+    bool igniteBodyVoxel(Body& b, int i, int j, int k);
+    void flameTouchesBodies(const Vec3& p, float prob);
+    World::BurnReport burnRep_;
+    float fireAcc_ = 0;
+    bool anyBurningBodies_ = false;
 
     float physAcc_ = 0, simAcc_ = 0, paintTimer_ = 0;
     float stepAccum_ = 0;

@@ -7,16 +7,24 @@
 #include "Config.h"
 #include "VoxMath.h"
 
-enum Material : uint8_t { M_AIR = 0, M_SAND = 1, M_WATER = 2, M_STONE = 3, M_BEDROCK = 4, M_DIRT = 5, M_GRASS = 6 };
+// Coal and oil each have a normal and a burning form (a burning voxel is tracked in World::burning, see FireWorld.cpp).
+// M_FIRE and M_SMOKE are elements of the Creator tool only: flames and smoke are particles (Fire.h), never stored in the grid.
+enum Material : uint8_t {
+    M_AIR = 0, M_SAND = 1, M_WATER = 2, M_STONE = 3, M_BEDROCK = 4, M_DIRT = 5, M_GRASS = 6,
+    M_COAL = 7, M_BCOAL = 8, M_OIL = 9, M_BOIL = 10, M_FIRE = 11, M_SMOKE = 12
+};
 
-// Materials the cellular automaton looks after: sand, water, and dirt / grass (settled dirt is static and only checked
-// when something around it changes; see Dirt.cpp).
-inline bool isCellular(uint8_t m) { return m == M_SAND || m == M_WATER || m == M_DIRT || m == M_GRASS; }
-inline bool isOpaque(uint8_t m) { return m == M_SAND || m >= M_STONE; }   // blocks light / the player
-inline bool isRigidSolid(uint8_t m) { return m == M_SAND || m >= M_STONE; }  // what rigid bodies collide with
+// Materials the cellular automaton looks after: sand, water, oil, and dirt / grass (settled dirt is static and only checked
+// when something around it changes; see Dirt.cpp). Burning oil does not flow: it stays where it caught fire and burns away.
+inline bool isCellular(uint8_t m) { return m == M_SAND || m == M_WATER || m == M_DIRT || m == M_GRASS || m == M_OIL; }
+inline bool isOpaque(uint8_t m) { return m == M_SAND || (m >= M_STONE && m <= M_BCOAL); }   // blocks light / the player
+inline bool isRigidSolid(uint8_t m) { return isOpaque(m); }  // what rigid bodies collide with
+inline bool isLiquid(uint8_t m) { return m == M_WATER || m == M_OIL || m == M_BOIL; }  // drawn by the water pass
+inline bool isRigidMat(uint8_t m) { return m == M_STONE || m == M_COAL || m == M_BCOAL; }  // forms rigid bodies when it is cut loose
 inline uint32_t matBit(uint8_t m) { return 1u << m; }
 // Everything solid a ray can hit in the grid (not water).
-constexpr uint32_t kGridSolidMask = (1u << M_SAND) | (1u << M_STONE) | (1u << M_BEDROCK) | (1u << M_DIRT) | (1u << M_GRASS);
+constexpr uint32_t kGridSolidMask = (1u << M_SAND) | (1u << M_STONE) | (1u << M_BEDROCK) | (1u << M_DIRT) | (1u << M_GRASS) | (1u << M_COAL) | (1u << M_BCOAL);
+constexpr uint32_t kGridLiquidMask = (1u << M_WATER) | (1u << M_OIL) | (1u << M_BOIL);
 
 // Raw voxel byte: bits 0-3 material, bits 4-5 water energy, bit 6 "queued for sim", bit 7 "moved this tick".
 // Bits 4-5 hold a 2-bit "energy" for water: the number of consecutive ticks (capped at 3) it has been free-falling.
@@ -206,7 +214,7 @@ public:
     bool overlayActive = false;    // true while any rigid body marks the overlay
     bool boxOn = false;
     int boxMin[3] = {0, 0, 0}, boxMax[3] = {0, 0, 0};
-    long long counts[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    long long counts[16] = {0};
     uint32_t quietCounter = 0;
     uint64_t simTickCount = 0;
     int lastTickMoves = 0;
@@ -261,6 +269,38 @@ public:
     int grassDepth(int x, int y, int z) const;
     void analyzeDirt(int maxSeeds);
     void growGrass(int maxEntries);
+
+    // ---- fire (FireWorld.cpp) ------------------------------------------------------------------------
+    // Burning coal and burning oil voxels, each with the seconds it has left. Burning coal stays where it is (and may be part
+    // of a static structure); burning oil does not flow (it falls if what is under it burns away).
+    struct BurnCell {
+        uint32_t cell;  // packed local cell
+        float left;     // seconds of burning left
+        float age = 0;  // seconds since it caught fire (a fresh fire flares up)
+    };
+    std::vector<BurnCell> burning;
+    size_t burnCursor = 0;
+    // Fire spreads through oil as a wave: from every voxel that has just caught fire (the front) it reaches the oil voxels next to
+    // it, layer by layer, kOilWaveSpeed layers a second; two places where fire met the oil are two waves that run into each other.
+    std::vector<uint32_t> oilFront;
+    float oilWaveAcc = 0;
+    Rng fireRng{0xF1AE5u};
+    struct BurnReport {
+        std::vector<uint32_t> burntOut;   // cells whose coal / oil has burnt away this step (packed)
+        std::vector<uint32_t> quenched;   // burning voxels that water put out (packed)
+        std::vector<uint32_t> caught;     // voxels that caught fire this step (packed)
+    };
+    // Water touches the voxel (6 neighbours): it cannot catch fire, and it is put out if it burns.
+    bool wet(int x, int y, int z) const;
+    // Sets coal / oil on fire (oil: every oil voxel connected to it, at once). False if it cannot burn (not fuel, or under water).
+    bool ignite(int x, int y, int z, BurnReport* rep = nullptr);
+    // Advances all burning voxels by dt seconds: burn-out, spreading to neighbouring coal (a third less eagerly than a flame
+    // lights it), instant spreading through oil, water putting fires out.
+    void burnStep(float dt, BurnReport& rep);
+    void registerBurning(int x, int y, int z, float left);  // (a loaded region that was saved while burning)
+    // Sets one oil voxel on fire (False: not oil, or under water) and puts it on `front`.
+    bool lightOil(int x, int y, int z, BurnReport* rep, std::vector<uint32_t>& front);
+    void advanceOilWave(float dt, BurnReport& rep);
 
     std::vector<TileList> tileCur, tileNext;  // active cells per tile
     std::vector<TileRng> tileRng;

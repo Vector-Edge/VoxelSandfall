@@ -40,7 +40,7 @@ int World::grassDepth(int x, int y, int z) const {
     static const int d[5][3] = {{0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
     auto open = [&](int xx, int yy, int zz) {
         const uint8_t m = get(xx, yy, zz);
-        return m == M_AIR || m == M_WATER;
+        return m == M_AIR || isLiquid(m);
     };
     for (const auto& k : d)
         if (open(x + k[0], y + k[1], z + k[2])) return 0;
@@ -155,7 +155,7 @@ bool columnSupported(const World& w, std::vector<uint8_t>& memo, std::vector<siz
             continue;
         }
         const uint8_t bm = b & VOX_MASK;
-        res = bm == M_SAND || bm == M_STONE || bm == M_BEDROCK;
+        res = bm == M_SAND || isRigidMat(bm) || bm == M_BEDROCK;
         break;
     }
     for (size_t i : chain) {
@@ -215,7 +215,7 @@ void World::analyzeDirt(int maxSeeds) {
                     }
                 } else {
                     const uint8_t nm = nr & VOX_MASK;
-                    if (nm == M_SAND || nm == M_STONE || nm == M_BEDROCK) contacts++;  // stuck to a wall / ceiling
+                    if (nm == M_SAND || isRigidMat(nm) || nm == M_BEDROCK) contacts++;  // stuck to a wall / ceiling
                 }
             }
         }

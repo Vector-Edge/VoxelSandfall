@@ -18,6 +18,10 @@ void Game::reset() {
     if (infinite) player.respawnAt(Vec3(cfg::WORLD_X * 0.5f, 1.0f, cfg::WORLD_Z * 0.5f));
     else player.respawn();
     particles.clear();
+    fx.clear();
+    fireLights.clear();
+    fireAcc_ = 0;
+    anyBurningBodies_ = false;
     hollow_.clear();
     world.splashes.clear();
     waterField.reset();
@@ -90,6 +94,10 @@ void Game::update(float dt, const GameInput& in) {
         physics.rasterizeOverlay();
         updateBodySplashes();
     }
+    {
+        prof::Scope sc(prof::P_FIRE);
+        updateFire(dt);
+    }
 
     // --- cellular automata (fixed tick rate) ----------------------------------------------------
     simAcc_ += dt;
@@ -126,7 +134,16 @@ PaintResult Game::paintAtCrosshair() {
     Vec3 center = h.hit ? h.point + h.normal * (r * 0.5f + 0.25f) : eye + dir * cfg::FREE_PAINT_DIST;
     Vec3 pmin, pmax;
     player.aabb(pmin, pmax);
-    PaintResult res = paintSphere(world, physics, center, r, currentMaterial(), pmin, pmax);
+    const uint8_t mat = currentMaterial();
+    if (mat == M_FIRE || mat == M_SMOKE) {  // flames and smoke are particles
+        PaintResult res;
+        res.placed = mat == M_FIRE ? std::clamp((int)(r * r * r * 0.6f), 6, 150) : std::clamp((int)(r * r * r * 0.3f), 4, 70);
+        if (mat == M_FIRE) spawnFlames(center, r, res.placed);
+        else spawnSmokeCloud(center, r, res.placed);
+        lastPlaced = res.placed;
+        return res;
+    }
+    PaintResult res = paintSphere(world, physics, center, r, mat, pmin, pmax);
     lastPlaced = res.placed;
     return res;
 }
@@ -138,7 +155,7 @@ CarveResult Game::fireAtCrosshair() {
     muzzleFlash = 0.06f;
     shotsFired++;
     CarveResult res;
-    SceneHit h = castScene(world, physics, eye, dir, cfg::REACH * 3, kGridSolidMask | matBit(M_WATER));
+    SceneHit h = castScene(world, physics, eye, dir, cfg::REACH * 3, kGridSolidMask | kGridLiquidMask);
     if (h.hit) {
         res = carveSphere(world, physics, h.point + dir * 0.3f, (float)brush, rng);
         spawnDebris(res);
@@ -164,7 +181,7 @@ void Game::updateTools(float dt, const GameInput& in) {
         preview.radius = r;
         preview.center = h.hit ? h.point + h.normal * (r * 0.5f + 0.25f) : eye + dir * cfg::FREE_PAINT_DIST;
 
-        const bool continuous = (mat == M_SAND || mat == M_WATER || mat == M_DIRT || mat == M_GRASS);
+        const bool continuous = (mat == M_SAND || mat == M_WATER || mat == M_DIRT || mat == M_GRASS || mat == M_OIL || mat == M_FIRE || mat == M_SMOKE);
         bool doPaint = false;
         if (continuous)
             doPaint = in.fireHeld && paintTimer_ <= 0;
@@ -177,7 +194,7 @@ void Game::updateTools(float dt, const GameInput& in) {
             paintTimer_ = std::max(base, (float)pr.placed / 250000.0f);
         }
     } else {
-        SceneHit h = castScene(world, physics, eye, dir, cfg::REACH * 3, kGridSolidMask | matBit(M_WATER));
+        SceneHit h = castScene(world, physics, eye, dir, cfg::REACH * 3, kGridSolidMask | kGridLiquidMask);
         preview.valid = h.hit;
         preview.onSurface = h.hit;
         preview.radius = (float)brush;

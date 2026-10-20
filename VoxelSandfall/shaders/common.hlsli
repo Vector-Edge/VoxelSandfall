@@ -20,6 +20,12 @@ cbuffer FrameCB : register(b0)
     float4 fogA;        // x = distance fog on, y = fog start distance (horizontal, from the eye), z = distance where it is total
     float4 fogB;        // yz = hash origin (global voxel x, z mod 65536), w = 1: sky below the horizon is fog coloured
     float4 skyView;     // rgb = zenith colour of the visible sky, w = cloud cover (0 = none)
+    float4 fireInfo;    // x = number of fire lights
+    float4 fireLights[16];  // xyz = position, w = radius (the flames merged into a few glows)
+    float4 fireBoxA;    // the fire volume (firevol.hlsl): xyz = min corner (voxels), w = voxels per heat texel
+    float4 fireBoxB;    // xyz = max corner, w = 1 when there is fire to draw
+    float4 fireGrid;    // xyz = heat texture size in texels, w = ray march steps
+    float4 depthInfo;   // x = near, y = far plane, zw = scene size in pixels
 };
 
 cbuffer ObjectCB : register(b1)
@@ -39,6 +45,17 @@ SamplerState linSamp : register(s1);
 static const float3 kNormals[6] = {
     float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1)
 };
+
+// Materials: 1 sand, 2 water, 3 stone, 4 permanent, 5 dirt, 6 grass, 7 coal, 8 burning coal, 9 oil, 10 burning oil.
+bool isSolidMat(uint m)
+{
+    return m == 1 || (m >= 3 && m <= 8);
+}
+
+bool isLiquidMat(uint m)
+{
+    return m == 2 || m >= 9;
+}
 
 float hash13(float3 p)
 {
@@ -177,7 +194,7 @@ float traceSky(float3 o, float3 d, float maxDist, int maxSteps)
         else
         {
             uint m = worldOcc.Load(int4(cell, 0)) & 15;
-            if (m == 1 || m >= 3) return 0;
+            if (isSolidMat(m)) return 0;
             lo = float3(cell);
             hi = lo + 1.0;
         }
@@ -222,7 +239,7 @@ float traceHit(float3 o, float3 d, float maxDist, int maxSteps, out float3 hn, o
         else
         {
             uint m = worldOcc.Load(int4(cell, 0)) & 15;
-            if (m == 1 || m >= 3)
+            if (isSolidMat(m))
             {
                 mat = m;
                 nrm = axisN * (axisD > 0 ? -1.0 : 1.0);
@@ -301,12 +318,52 @@ float3 materialColor(uint m, float h1, float h2, float dist)
         c = lerp(c, float3(0.33, 0.25, 0.14), step(0.93, h1) * 0.8);
         return c * v;
     }
+    if (m == 7 || m == 8)  // coal: nearly black, with the odd bright facet
+    {
+        float3 c = float3(0.026, 0.026, 0.030) * (0.55 + 1.1 * h1);
+        c += step(0.955, h2) * float3(0.05, 0.05, 0.06) * (0.5 + h1);
+        c += step(0.993, h1) * float3(0.10, 0.10, 0.12);
+        return c;
+    }
     if (m == 6)  // grass
     {
         float3 c = lerp(float3(0.040, 0.125, 0.025), float3(0.095, 0.20, 0.040), h2);
         return c * (0.8 + 0.4 * h1);
     }
     return float3(0.25, 0.248, 0.245) * v * float3(1.0, 1.0 + (h2 - 0.5) * 0.05 * fade, 1.0);   // normal stone
+}
+
+// Light the flames cast on the surfaces around them (no shadows: a handful of soft glows, see Game::updateFireLights).
+float3 fireGlow(float3 p, float3 n)
+{
+    float3 acc = 0;
+    const int cnt = (int)fireInfo.x;
+    [loop] for (int i = 0; i < cnt; i++)
+    {
+        const float4 L = fireLights[i];
+        const float3 d = L.xyz - p;
+        const float r2 = dot(d, d);
+        const float R = L.w;
+        float k = saturate(1.0 - r2 / (R * R));
+        k *= k;
+        const float nd = saturate(dot(n, d * rsqrt(r2 + 1e-3)) * 0.85 + 0.15);
+        const float pw = (R - 34.0) / 20.0;
+        const float flick = 0.86 + 0.14 * sin(camPos.w * 11.0 + i * 3.7) * sin(camPos.w * 7.3 + i * 1.3);
+        acc += k * nd * flick * (0.12 + 0.018 * pw * pw);
+    }
+    acc = acc / (1.0 + 0.55 * acc);  // (a big fire is not unboundedly bright)
+    return acc * float3(1.0, 0.47, 0.16);
+}
+
+// What burning things glow with (linear, added before tone mapping).
+float3 materialEmission(uint m, float h1, float h2, float3 cell)
+{
+    if (m != 8) return 0;
+    const float t = camPos.w;
+    const float fl = 0.55 + 0.45 * vnoise(cell.xz * 0.9 + cell.y * 1.7 + t * 2.4);
+    float3 e = float3(1.0, 0.22, 0.04) * (0.30 + 1.25 * h1 * fl);
+    e += step(0.88, h2) * float3(1.0, 0.45, 0.10) * fl * 0.9;   // hotter spots
+    return e;
 }
 
 // ---- per-pixel ambient occlusion from the occupancy volume (chunk meshes carry no vertex AO) ----------
@@ -320,7 +377,7 @@ bool occOpaque(int3 c)
     if (c.y < 0) return true;
     if (c.y >= dims.y || c.x < 0 || c.z < 0 || c.x >= dims.x || c.z >= dims.z) return false;
     uint m = worldOcc.Load(int4(c, 0)) & 15;
-    return m == 1 || m >= 3;
+    return isSolidMat(m);
 }
 
 float aoLevel(bool s1, bool s2, bool c)

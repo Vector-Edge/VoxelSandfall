@@ -55,25 +55,42 @@ void labelComponents(const std::vector<IVec3>& cells, std::vector<std::vector<IV
 // ------------------------------------------------------------------------------------------------
 // Body
 // ------------------------------------------------------------------------------------------------
-void Body::assignCells(const std::vector<IVec3>& cells) {
+void Body::assignCells(const std::vector<IVec3>& cells, uint8_t newMat, const std::vector<uint8_t>* mats) {
     IVec3 mn = cells[0], mx = cells[0];
     for (const IVec3& c : cells) {
         mn = IVec3(std::min(mn.x, c.x), std::min(mn.y, c.y), std::min(mn.z, c.z));
         mx = IVec3(std::max(mx.x, c.x), std::max(mx.y, c.y), std::max(mx.z, c.z));
     }
     const Vec3 oldCom = com;
+    const std::vector<uint8_t> oldOcc = occ;  // (the cells are expressed in the old lattice: they keep their materials)
+    const int onx = nx, ony = ny, onz = nz;
+    std::vector<BodyBurn> oldBurn;
+    oldBurn.swap(burn);
     nx = mx.x - mn.x + 1;
     ny = mx.y - mn.y + 1;
     nz = mx.z - mn.z + 1;
     occ.assign((size_t)nx * ny * nz, 0);
     double sx = 0, sy = 0, sz = 0;
-    for (const IVec3& c : cells) {
+    for (size_t ci = 0; ci < cells.size(); ci++) {
+        const IVec3& c = cells[ci];
         int i = c.x - mn.x, j = c.y - mn.y, k = c.z - mn.z;
-        occ[(size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * (size_t)k)] = 1;
+        uint8_t mat = newMat;
+        if (mats) {
+            mat = (*mats)[ci];
+        } else if ((unsigned)c.x < (unsigned)onx && (unsigned)c.y < (unsigned)ony && (unsigned)c.z < (unsigned)onz) {
+            const uint8_t o = oldOcc[(size_t)c.x + (size_t)onx * ((size_t)c.y + (size_t)ony * (size_t)c.z)];
+            if (o) mat = o;
+        }
+        occ[(size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * (size_t)k)] = mat;
         sx += i + 0.5;
         sy += j + 0.5;
         sz += k + 0.5;
     }
+    for (const BodyBurn& bb : oldBurn) {  // the burning voxels that are still there
+        const int i = bb.i - mn.x, j = bb.j - mn.y, k = bb.k - mn.z;
+        if (matAt(i, j, k) == M_BCOAL) burn.push_back({i, j, k, bb.left});
+    }
+    burnDirty = true;
     const double inv = 1.0 / (double)cells.size();
     const Vec3 newCom((float)(sx * inv), (float)(sy * inv), (float)(sz * inv));
     // World placement of the new COM, expressed through the old lattice transform.
@@ -161,16 +178,26 @@ void Body::updateInertiaWorld() {
 // ------------------------------------------------------------------------------------------------
 // Physics: creation / editing
 // ------------------------------------------------------------------------------------------------
-Body* Physics::createFromWorldCells(const std::vector<IVec3>& cells) {
+void Physics::connectedComponents(const std::vector<IVec3>& cells, std::vector<std::vector<IVec3>>& out) {
+    out.clear();
+    if (!cells.empty()) labelComponents(cells, out);
+}
+
+Body* Physics::createFromWorldCells(const std::vector<IVec3>& cells, const std::vector<uint8_t>* mats, uint8_t mat) {
     auto up = std::make_unique<Body>();
     up->id = nextId++;
-    up->assignCells(cells);
+    up->assignCells(cells, mat, mats);
+    for (size_t i = 0; i < up->occ.size(); i++)
+        if (up->occ[i] == M_BCOAL) {  // (cut loose while burning: it carries on)
+            const int w = up->nx, h = up->ny;
+            up->burn.push_back({(int)(i % (size_t)w), (int)((i / (size_t)w) % (size_t)h), (int)(i / ((size_t)w * (size_t)h)), 20.0f});
+        }
     Body* p = up.get();
     bodies.push_back(std::move(up));
     return p;
 }
 
-void Physics::setBodyCells(Body& b, const std::vector<IVec3>& cells) {
+void Physics::setBodyCells(Body& b, const std::vector<IVec3>& cells, uint8_t newMat) {
     if (cells.empty()) {
         b.dead = true;
         return;
@@ -190,10 +217,15 @@ void Physics::setBodyCells(Body& b, const std::vector<IVec3>& cells) {
         nb->rot = b.rot;
         nb->vel = b.vel;
         nb->ang = b.ang;
-        nb->assignCells(comps[i]);
+        nb->nx = b.nx;  // (the component's cells are expressed in b's lattice: it keeps their materials and burning state)
+        nb->ny = b.ny;
+        nb->nz = b.nz;
+        nb->occ = b.occ;
+        nb->burn = b.burn;
+        nb->assignCells(comps[i], newMat);
         bodies.push_back(std::move(nb));
     }
-    b.assignCells(comps[largest]);
+    b.assignCells(comps[largest], newMat);
     b.wake();
 }
 

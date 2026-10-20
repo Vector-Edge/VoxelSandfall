@@ -79,7 +79,7 @@ bool World::anySolidIn(int x0, int y0, int z0, int x1, int y1, int z1) const {
                                 uint8_t any = 0;
                                 for (int x = 0; x < 8; x++) {
                                     const uint8_t m = row[b * 8 + x] & VOX_MASK;
-                                    any |= (m == M_SAND || m >= M_STONE);
+                                    any |= isRigidSolid(m) ? 1 : 0;
                                 }
                                 f[b] |= any;
                             }
@@ -115,7 +115,7 @@ void World::set(int x, int y, int z, uint8_t m) {
     data[i] = m;
     counts[old]--;
     counts[m]++;
-    if ((old == M_WATER && m == M_AIR) || (old == M_AIR && m == M_WATER)) markDirtyWater(x, y, z);
+    if ((isLiquid(old) && m == M_AIR) || (old == M_AIR && isLiquid(m))) markDirtyWater(x, y, z);
     else markDirty(x, y, z);
     wakeAround(x, y, z);
 }
@@ -209,6 +209,9 @@ void World::generateArena() {
     dirtHead = 0;
     grassActive.clear();
     grassCursor = 0;
+    burning.clear();
+    burnCursor = 0;
+    oilFront.clear();
     auto put = [&](int x, int y, int z, uint8_t m) { data[idx(x, y, z)] = m; };
 
     // 256 x 256 x 1 Permanent Stone (bedrock) floor.

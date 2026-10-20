@@ -22,7 +22,7 @@ struct VSOut
 float4 VSShadow(VSIn i) : SV_Position
 {
     // Water droplets do not cast shadows (they would show up as black spots on the bed of a pool): park them outside the clip volume.
-    if (((i.attr >> 3) & 7) == 2) return float4(4, 4, 4, 1);
+    if (((i.attr >> 3) & 15) == 2) return float4(4, 4, 4, 1);
     float4 p = mul(model, float4(i.pos, 1));
     p.xz += i.off;
     return mul(lightViewProj, p);
@@ -32,8 +32,8 @@ VSOut VSWorld(VSIn i)
 {
     VSOut o;
     uint n = i.attr & 7;
-    uint m = (i.attr >> 3) & 7;
-    uint ao = (i.attr >> 6) & 3;
+    uint m = (i.attr >> 3) & 15;
+    uint ao = (i.attr >> 7) & 3;
     float4 wp = mul(model, float4(i.pos, 1));
     wp.xz += i.off;
     o.sv = mul(viewProj, wp);
@@ -72,6 +72,8 @@ float4 PSWorld(VSOut i) : SV_Target
     float3 ambient = hemi * skyVis * aoTerm;
     float3 lit = albedo * (sunColor.rgb * sunDir.w * sun + ambient);
     if (i.mat == 2) lit += float3(0.05, 0.12, 0.2);  // splash droplets glow a little so they read as water
+    lit += albedo * fireGlow(i.wpos, n);              // flames light what is near them
+    lit += materialEmission(i.mat, h1, h2, cell);     // burning coal glows
     float3 col = toDisplay(lit);
     col = lerp(col, fogColorDisplay(i.wpos), fogAmount(i.wpos));
     return float4(col + ditherNoise(i.sv.xy) / 255.0, 1);
@@ -145,7 +147,7 @@ float caustics(float2 p, float t, int octaves)
 
 bool isWaterCell(int3 c)
 {
-    return c.y >= 0 && (worldOcc.Load(int4(c, 0)) & 15) == 2;
+    return c.y >= 0 && isLiquidMat(worldOcc.Load(int4(c, 0)) & 15);
 }
 
 struct WaterOut
@@ -156,6 +158,8 @@ struct WaterOut
 
 WaterOut PSWater(VSOut i)
 {
+    const bool oil = i.mat >= 9;       // 9 oil, 10 burning oil (the same pass as water, but thick, dark and shiny)
+    const bool burning = i.mat == 10;
     const float3 on = kNormals[i.nidx];
     const int3 cell = int3(floor(i.wpos - on * 0.5));  // the water voxel that owns this face
     const float3 toEye = camPos.xyz - i.wpos;
@@ -204,12 +208,13 @@ WaterOut PSWater(VSOut i)
     // A film a voxel or two deep (the water where it runs out over a bank or a stone terrace) is not a mirror: it only wets
     // what is under it. Its reflection, ripples and glints fade out with the depth.
     const float thin = smoothstep(0.5, 3.5, (float)depth);
-    const float2 slope = (fld.xy * 1.8 + waveSlope(gp, camPos.w, footprint, detail) * calm) * (0.25 + 0.75 * thin);
+    const float2 slope = (fld.xy * 1.8 + waveSlope(gp, camPos.w, footprint, detail) * calm) * (0.25 + 0.75 * thin) * (oil ? 0.30 : 1.0);
     const float3 n = surface ? normalize(float3(-slope.x, 1.0, -slope.y)) : on;
 
     // Fresnel (Schlick, water F0 = 0.02): grazing views are mirrors, looking straight down you see through.
     const float cosV = saturate(dot(n, v));
-    const float F = (0.02 + 0.98 * pow(1.0 - cosV, 5.0)) * thin;
+    const float F0 = oil ? 0.05 : 0.02;
+    const float F = (F0 + (1.0 - F0) * pow(1.0 - cosV, 5.0)) * thin;
 
     // What the surface mirrors: the sky, or the voxels (walls, sand heaps) the reflected ray hits.
     float3 r = reflect(-v, n);
@@ -239,9 +244,9 @@ WaterOut PSWater(VSOut i)
     const float3 light = sunColor.rgb * sunDir.w * sunTop * 0.5 + lerp(groundCol.rgb, skyZenith.rgb, 0.85) * 0.9;
     const float cosR = sqrt(max(0.0, 1.0 - (1.0 - cosV * cosV) / 1.78));  // refracted view angle
     const float pathLen = depth / max(cosR, 0.3);
-    const float3 T = exp(-float3(0.075, 0.024, 0.012) * pathLen);
+    const float3 T = exp(-(oil ? float3(0.34, 0.22, 0.12) : float3(0.075, 0.024, 0.012)) * pathLen);
     const float3 Tg = pow(T, 1.0 / 2.2);  // transmittance in display space (the frame buffer holds display colours)
-    const float3 bodyCol = toDisplay(float3(0.012, 0.075, 0.095) * light * 3.0);
+    const float3 bodyCol = toDisplay((oil ? float3(0.030, 0.018, 0.006) : float3(0.012, 0.075, 0.095)) * light * 3.0);
 
     float3 add = F * toDisplay(refl) + (1.0 - F) * (1.0 - Tg) * bodyCol;
     // Sun glints: the sun's mirror image in the ripples. Tonemapped on its own (the sun is far brighter than anything the
@@ -251,11 +256,18 @@ WaterOut PSWater(VSOut i)
         const float sd = saturate(dot(r, sunDir.xyz));
         add += toDisplay(F * sunVis * sunColor.rgb * sunDir.w * (pow(sd, 700.0) * 9.0 + pow(sd, 70.0) * 0.12));
     }
-    float3 mul = (1.0 - F) * Tg * lerp(0.82, 1.0, thin);  // wet stone is darker
+    if (oil)  // a thin film of oil shimmers in rainbow colours
+    {
+        const float ph = cosV * 5.0 + vnoise(gp * 0.05) * 8.0 + camPos.w * 0.05;
+        const float3 irid = 0.5 + 0.5 * cos(6.2831853 * (ph + float3(0.0, 0.33, 0.67)));
+        add += irid * (F * 0.25 + 0.02);
+    }
+    add += toDisplay(fireGlow(i.wpos, n) * 0.08);  // flames light the liquid too
+    float3 mul = (1.0 - F) * Tg * lerp(oil ? 0.50 : 0.82, 1.0, thin);  // wet stone is darker (oil stains it)
 
     // Sunlight focused by the rippled surface dances over the bed (only where the bed is lit and the water is neither
     // paper thin nor deep, and not so far away that it would shimmer).
-    const float causticK = smoothstep(1.5, 6.0, depth) * (1.0 - smoothstep(30.0, 80.0, depth)) * (1.0 - smoothstep(160.0, 420.0, dist));
+    const float causticK = (oil ? 0.0 : 1.0) * smoothstep(1.5, 6.0, depth) * (1.0 - smoothstep(30.0, 80.0, depth)) * (1.0 - smoothstep(160.0, 420.0, dist));
     [branch] if (detail >= 1 && surface && sunTop > 0.01 && causticK > 0.02)  // the Worley pattern is the priciest part: only where it shows
     {
         const float3 rd = refract(-v, n, 1.0 / 1.33);
@@ -264,7 +276,7 @@ WaterOut PSWater(VSOut i)
     }
 
     // Foam: lacy white on fresh splashes and in a thin line where the water meets land.
-    [branch] if (surface && (fld.z > 0.02 || fld.w > 0.12))
+    [branch] if (!oil && surface && (fld.z > 0.02 || fld.w > 0.12))
     {
         const float lace = detail >= 2 ? 0.5 * vnoise(gp * 0.9 + camPos.w * 0.08) + 0.5 * vnoise(gp * 2.3 - camPos.w * 0.05)
                          : (detail == 1 ? vnoise(gp * 1.2 + camPos.w * 0.06) : 0.5);
@@ -274,6 +286,16 @@ WaterOut PSWater(VSOut i)
         const float3 foamCol = toDisplay(light * float3(0.80, 0.85, 0.88));
         add = lerp(add, foamCol, foamAmt);
         mul *= 1.0 - foamAmt;
+    }
+
+    // Burning oil: the whole surface is aflame (flames themselves are particles above it).
+    if (burning)
+    {
+        const float fl = 0.5 + 0.5 * vnoise(gp * 0.45 + camPos.w * 2.6);
+        const float fl2 = vnoise(gp * 1.3 - camPos.w * 3.3);
+        const float3 glow = float3(1.7, 0.50, 0.09) * (0.55 + 1.15 * fl * (0.6 + 0.8 * fl2));
+        add = lerp(add, toDisplay(glow), 0.9);
+        mul *= 0.12;
     }
 
     // chunk fog: the water fades into the fog like everything else (what is seen through it is already fogged)

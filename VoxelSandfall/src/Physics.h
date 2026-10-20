@@ -8,10 +8,19 @@
 #include "VoxMath.h"
 #include "World.h"
 
+// A burning coal voxel of a body (lattice coordinates) and the seconds it has left.
+struct BodyBurn {
+    int i, j, k;
+    float left;
+};
+
 struct Body {
     int id = 0;
     int nx = 0, ny = 0, nz = 0;      // lattice dimensions
-    std::vector<uint8_t> occ;        // nx*ny*nz occupancy
+    std::vector<uint8_t> occ;        // nx*ny*nz: 0 = empty, otherwise the material of the voxel (stone, coal, burning coal)
+    std::vector<BodyBurn> burn;      // the burning voxels (their occ value is M_BCOAL)
+    bool burnDirty = false;          // the burning state changed: the mesh is stale (refreshed a few times a second)
+    float burnMeshT = 0, burnCutT = 0;  // seconds since the mesh was refreshed / since burnt-away voxels were cut out
     int count = 0;
     Vec3 com;                        // centre of mass in lattice space
     Vec3 pos;                        // world position of the COM
@@ -41,13 +50,21 @@ struct Body {
         return (unsigned)i < (unsigned)nx && (unsigned)j < (unsigned)ny && (unsigned)k < (unsigned)nz &&
                occ[(size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * (size_t)k)] != 0;
     }
+    uint8_t matAt(int i, int j, int k) const {  // 0 outside / empty
+        return ((unsigned)i < (unsigned)nx && (unsigned)j < (unsigned)ny && (unsigned)k < (unsigned)nz)
+                   ? occ[(size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * (size_t)k)]
+                   : (uint8_t)0;
+    }
+    uint8_t& matRef(int i, int j, int k) { return occ[(size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * (size_t)k)]; }
     Vec3 toWorld(const Vec3& bodyFrame) const { return pos + rot.rotate(bodyFrame); }
     Vec3 latticeToWorld(const Vec3& lat) const { return toWorld(lat - com); }
     Vec3 worldToLattice(const Vec3& w) const { return rot.conjugate().rotate(w - pos) + com; }
 
     // Replace the voxel set. `cells` are integer lattice coordinates in the *current* lattice
     // (they may lie outside it). The world placement of every voxel is preserved.
-    void assignCells(const std::vector<IVec3>& cells);
+    // `mats` (optional, parallel to `cells`) gives each voxel's material; without it a voxel keeps the material it has in the
+    // current lattice, and one that is not in it yet gets `newMat`.
+    void assignCells(const std::vector<IVec3>& cells, uint8_t newMat = M_STONE, const std::vector<uint8_t>* mats = nullptr);
     void collectCells(std::vector<IVec3>& out) const;
     void computeMassProps();
     void updateInertiaWorld();
@@ -77,9 +94,12 @@ public:
     int lastContactCount = 0;
 
     // Create a dynamic body from world-space voxel cells (axis aligned, identity transform).
-    Body* createFromWorldCells(const std::vector<IVec3>& cells);
-    // Replace a body's voxels (lattice coords). Empty -> removed, disconnected -> split into several.
-    void setBodyCells(Body& b, const std::vector<IVec3>& cells);
+    Body* createFromWorldCells(const std::vector<IVec3>& cells, const std::vector<uint8_t>* mats = nullptr, uint8_t mat = M_STONE);
+    // Replace a body's voxels (lattice coords). Empty -> removed, disconnected -> split into several. Voxels that are not in
+    // the lattice yet get `newMat`.
+    void setBodyCells(Body& b, const std::vector<IVec3>& cells, uint8_t newMat = M_STONE);
+    // The face-connected pieces of a set of cells.
+    static void connectedComponents(const std::vector<IVec3>& cells, std::vector<std::vector<IVec3>>& out);
 
     void step(float dt);
     void wakeNear(const Vec3& c, float r);

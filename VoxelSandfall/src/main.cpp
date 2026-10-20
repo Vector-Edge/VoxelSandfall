@@ -352,6 +352,36 @@ bool runScript(const std::string& path) {
             logLine("player pos=(%.1f %.1f %.1f) vel=(%.1f %.1f %.1f)", game.player.pos.x, game.player.pos.y, game.player.pos.z, game.player.vel.x, game.player.vel.y, game.player.vel.z);
             for (auto& up : game.physics.bodies)
                 logLine("  body %d: %d voxels pos=(%.1f %.1f %.1f) vel=(%.1f %.1f %.1f) ang=%.2f sandF=(%.0f %.0f) %s", up->id, up->count, up->pos.x, up->pos.y, up->pos.z, up->vel.x, up->vel.y, up->vel.z, length(up->ang), up->sandF.x, up->sandF.z, up->asleep ? "asleep" : "awake");
+        } else if (cmd == "fillcoal" || cmd == "filloil") {  // fillcoal|filloil x0 x1 y0 y1 z0 z1   (static, as if it had always been there)
+            int x0, x1, y0, y1, z0, z1;
+            ss >> x0 >> x1 >> y0 >> y1 >> z0 >> z1;
+            const uint8_t m = cmd == "fillcoal" ? M_COAL : M_OIL;
+            for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    for (int x = x0; x <= x1; x++) game.world.setRaw(x, y, z, m);
+            game.world.notifyBox(x0, y0, z0, x1, y1, z1);
+        } else if (cmd == "ignite") {  // ignite x y z   (sets the coal / oil at that cell on fire)
+            int x, y, z;
+            ss >> x >> y >> z;
+            logLine("script %d: ignite %d %d %d -> %s", lineNo, x, y, z, game.igniteAt(x, y, z) ? "caught" : "nothing to burn");
+        } else if (cmd == "flames" || cmd == "smoke") {  // flames|smoke x y z radius count
+            float px, py, pz, pr;
+            int n = 40;
+            ss >> px >> py >> pz >> pr >> n;
+            if (cmd == "flames") game.spawnFlames(Vec3(px, py, pz), pr, n);
+            else game.spawnSmokeCloud(Vec3(px, py, pz), pr, n);
+        } else if (cmd == "dropcoal") {  // dropcoal x y z radius   (paints coal in the air: it comes down as pebbles)
+            float px, py, pz, pr;
+            ss >> px >> py >> pz >> pr;
+            const Vec3 nowhere(0, 0, 0), nowhere2(1, 1, 1);
+            const PaintResult res = paintSphere(game.world, game.physics, Vec3(px, py, pz), pr, M_COAL, nowhere, nowhere2);
+            logLine("script %d: dropcoal placed %d, %d new bodies", lineNo, res.placed, res.newBodies);
+        } else if (cmd == "firestat") {  // firestat   (what is burning)
+            long long bb = 0;
+            for (auto& up : game.physics.bodies) bb += (long long)up->burn.size();
+            logLine("script %d: fire: %lld burning coal, %lld burning oil, %lld burning in rocks; %zu flames, %zu smoke, %zu lights; coal %lld oil %lld; %zu bodies", lineNo,
+                    game.world.counts[M_BCOAL], game.world.counts[M_BOIL], bb, game.flameCount(), game.smokeCount(), game.fireLights.size(), game.world.counts[M_COAL],
+                    game.world.counts[M_OIL], game.physics.bodies.size());
         } else if (cmd == "impacts") {  // impacts on|off   (water splash / soak behaviour, for comparisons)
             std::string v;
             ss >> v;
@@ -425,7 +455,9 @@ bool runScript(const std::string& path) {
         } else if (cmd == "material") {
             std::string v;
             ss >> v;
-            game.materialIndex = v == "sand" ? 0 : v == "water" ? 1 : v == "stone" ? 2 : v == "dirt" ? 4 : v == "grass" ? 5 : 3;
+            static const char* names[kPaintMaterialCount] = {"sand", "water", "stone", "permanent", "dirt", "grass", "coal", "fire", "smoke", "oil"};
+            for (int k = 0; k < kPaintMaterialCount; k++)
+                if (v == names[k]) game.materialIndex = k;
         } else if (cmd == "brush") {
             int b = 4;
             ss >> b;
@@ -670,7 +702,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             gi.selectCreator = pressed('R');
             gi.selectGun = pressed('F');
             for (int k = 1; k <= kPaintMaterialCount; k++)
-                if (pressed('0' + k)) gi.selectMaterial = k;
+                if (pressed(k == 10 ? '0' : '0' + k)) gi.selectMaterial = k;
             if (pressed('E')) gi.cycleMaterial = 1;
             if (pressed('Q')) gi.cycleMaterial = -1;
             POINT p;

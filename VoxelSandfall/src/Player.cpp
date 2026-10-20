@@ -39,9 +39,9 @@ float Player::sampleWater(const World& w) const {
     int wet = 0;
     for (int i = 0; i < 8; i++) {
         const int y = floorToInt(pos.y + (i + 0.5f) * cfg::PLAYER_H / 8.0f);
-        if (w.get(floorToInt(pos.x), y, floorToInt(pos.z)) == M_WATER || w.get(floorToInt(pos.x + hw), y, floorToInt(pos.z)) == M_WATER ||
-            w.get(floorToInt(pos.x - hw), y, floorToInt(pos.z)) == M_WATER || w.get(floorToInt(pos.x), y, floorToInt(pos.z + hw)) == M_WATER ||
-            w.get(floorToInt(pos.x), y, floorToInt(pos.z - hw)) == M_WATER)
+        if (isLiquid(w.get(floorToInt(pos.x), y, floorToInt(pos.z))) || isLiquid(w.get(floorToInt(pos.x + hw), y, floorToInt(pos.z))) ||
+            isLiquid(w.get(floorToInt(pos.x - hw), y, floorToInt(pos.z))) || isLiquid(w.get(floorToInt(pos.x), y, floorToInt(pos.z + hw))) ||
+            isLiquid(w.get(floorToInt(pos.x), y, floorToInt(pos.z - hw))))
             wet++;
     }
     return (float)wet / 8.0f;

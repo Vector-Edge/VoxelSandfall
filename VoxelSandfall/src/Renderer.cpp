@@ -20,6 +20,9 @@ struct FrameCB {
     float camPos[4], sunDir[4], sunColor[4], skyZenith[4], skyHorizon[4], groundCol[4];
     float params[4], gridDims[4], camRight[4], camUp[4], camFwd[4], qual[4];
     float fogA[4], fogB[4], skyView[4];
+    float fireInfo[4];          // x = number of fire lights
+    float fireLights[16][4];    // xyz = position, w = radius (the power is derived from it, see fireGlow in common.hlsli)
+    float fireBoxA[4], fireBoxB[4], fireGrid[4], depthInfo[4];  // the fire volume (firevol.hlsl)
 };
 struct ObjectCB {
     Mat4 model;
@@ -257,6 +260,10 @@ bool Renderer::createSizeResources() {
     msaaDepth_.Reset();
     msaaRTV_.Reset();
     msaaDSV_.Reset();
+    msaaDepthSRV_.Reset();
+    fireDepthTex_.Reset();
+    fireDepthRTV_.Reset();
+    fireDepthSRV_.Reset();
     sceneTex_.Reset();
     sceneSRV_.Reset();
     VS_CHECK(swap_->GetBuffer(0, IID_PPV_ARGS(&backTex_)));
@@ -276,10 +283,30 @@ bool Renderer::createSizeResources() {
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
     VS_CHECK(dev_->CreateTexture2D(&td, nullptr, &msaaColor_));
     VS_CHECK(dev_->CreateRenderTargetView(msaaColor_.Get(), nullptr, &msaaRTV_));
-    td.Format = DXGI_FORMAT_D32_FLOAT;
-    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    td.Format = DXGI_FORMAT_R32_TYPELESS;  // (the fire volume reads the scene's depth)
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     VS_CHECK(dev_->CreateTexture2D(&td, nullptr, &msaaDepth_));
-    VS_CHECK(dev_->CreateDepthStencilView(msaaDepth_.Get(), nullptr, &msaaDSV_));
+    {
+        const bool ms = sampleCount_ > 1;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {};
+        dvd.Format = DXGI_FORMAT_D32_FLOAT;
+        dvd.ViewDimension = ms ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+        VS_CHECK(dev_->CreateDepthStencilView(msaaDepth_.Get(), &dvd, &msaaDSV_));
+        D3D11_SHADER_RESOURCE_VIEW_DESC svd = {};
+        svd.Format = DXGI_FORMAT_R32_FLOAT;
+        svd.ViewDimension = ms ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+        svd.Texture2D.MipLevels = 1;
+        VS_CHECK(dev_->CreateShaderResourceView(msaaDepth_.Get(), &svd, &msaaDepthSRV_));
+    }
+    {
+        D3D11_TEXTURE2D_DESC fd = td;
+        fd.Format = DXGI_FORMAT_R32_FLOAT;
+        fd.SampleDesc.Count = 1;
+        fd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        VS_CHECK(dev_->CreateTexture2D(&fd, nullptr, &fireDepthTex_));
+        VS_CHECK(dev_->CreateRenderTargetView(fireDepthTex_.Get(), nullptr, &fireDepthRTV_));
+        VS_CHECK(dev_->CreateShaderResourceView(fireDepthTex_.Get(), nullptr, &fireDepthSRV_));
+    }
     if (scaled) {  // the resolved scene, which the upscale pass reads
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.SampleDesc.Count = 1;
@@ -324,6 +351,10 @@ void Renderer::resize(int width, int height) {
     msaaDepth_.Reset();
     msaaRTV_.Reset();
     msaaDSV_.Reset();
+    msaaDepthSRV_.Reset();
+    fireDepthTex_.Reset();
+    fireDepthRTV_.Reset();
+    fireDepthSRV_.Reset();
     sceneTex_.Reset();
     sceneSRV_.Reset();
     if (FAILED(swap_->ResizeBuffers(0, (UINT)width_, (UINT)height_, DXGI_FORMAT_UNKNOWN, 0))) {
@@ -394,6 +425,57 @@ bool Renderer::createStaticResources() {
         VS_CHECK(dev_->CreateTexture3D(&td, nullptr, &brickTexB_));
         VS_CHECK(dev_->CreateShaderResourceView(brickTexB_.Get(), nullptr, &brickSRVB_));
     }
+    // Fire: the heat field (rebuilt every frame while something burns) and a tileable 3D noise for the flames' turbulence.
+    {
+        D3D11_TEXTURE3D_DESC td = {};
+        td.Width = kHX;
+        td.Height = kHY;
+        td.Depth = kHZ;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8_UNORM;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        heat_.assign((size_t)kHX * kHY * kHZ, 0);
+        D3D11_SUBRESOURCE_DATA sd = {heat_.data(), (UINT)kHX, (UINT)(kHX * kHY)};
+        VS_CHECK(dev_->CreateTexture3D(&td, &sd, &heatTex_));
+        VS_CHECK(dev_->CreateShaderResourceView(heatTex_.Get(), nullptr, &heatSRV_));
+        colStr_.assign((size_t)kHX * kHZ, 0.0f);
+        colY_.assign((size_t)kHX * kHZ, 0.0f);
+        colStamp_.assign((size_t)kHX * kHZ, 0);
+
+        // periodic value noise, three octaves (4, 8 and 16 cells per tile), smoothly interpolated
+        const int N = 64;
+        std::vector<uint8_t> nz((size_t)N * N * N);
+        const int freqs[3] = {4, 8, 16};
+        const float weights[3] = {0.52f, 0.30f, 0.18f};
+        std::vector<float> acc((size_t)N * N * N, 0.0f);
+        for (int o = 0; o < 3; o++) {
+            const int f = freqs[o];
+            std::vector<float> lat((size_t)f * f * f);
+            Rng r(0x5EED1234u + (uint32_t)o * 7919u);
+            for (float& v : lat) v = r.f();
+            auto L = [&](int x, int y, int z) { return lat[(size_t)(x % f) + (size_t)f * ((size_t)(y % f) + (size_t)f * (size_t)(z % f))]; };
+            for (int z = 0; z < N; z++)
+                for (int y = 0; y < N; y++)
+                    for (int x = 0; x < N; x++) {
+                        const float u = (float)x * f / N, v = (float)y * f / N, w = (float)z * f / N;
+                        const int x0 = (int)u, y0 = (int)v, z0 = (int)w;
+                        auto sm = [](float t) { return t * t * (3.0f - 2.0f * t); };
+                        const float fx = sm(u - x0), fy = sm(v - y0), fz = sm(w - z0);
+                        auto lerpf = [](float a, float b, float t) { return a + (b - a) * t; };
+                        const float c00 = lerpf(L(x0, y0, z0), L(x0 + 1, y0, z0), fx), c10 = lerpf(L(x0, y0 + 1, z0), L(x0 + 1, y0 + 1, z0), fx);
+                        const float c01 = lerpf(L(x0, y0, z0 + 1), L(x0 + 1, y0, z0 + 1), fx), c11 = lerpf(L(x0, y0 + 1, z0 + 1), L(x0 + 1, y0 + 1, z0 + 1), fx);
+                        acc[(size_t)x + (size_t)N * ((size_t)y + (size_t)N * (size_t)z)] += weights[o] * lerpf(lerpf(c00, c10, fy), lerpf(c01, c11, fy), fz);
+                    }
+        }
+        for (size_t i = 0; i < nz.size(); i++) nz[i] = (uint8_t)std::clamp((int)(acc[i] * 255.0f + 0.5f), 0, 255);
+        D3D11_TEXTURE3D_DESC nd = td;
+        nd.Width = nd.Height = nd.Depth = (UINT)N;
+        nd.Usage = D3D11_USAGE_IMMUTABLE;
+        D3D11_SUBRESOURCE_DATA nsd = {nz.data(), (UINT)N, (UINT)(N * N)};
+        VS_CHECK(dev_->CreateTexture3D(&nd, &nsd, &noiseTex_));
+        VS_CHECK(dev_->CreateShaderResourceView(noiseTex_.Get(), nullptr, &noiseSRV_));
+    }
     // Water surface field (ripples, foam, smoothed slope): RGBA16F, one texel per world column.
     {
         D3D11_TEXTURE2D_DESC td = {};
@@ -455,6 +537,11 @@ bool Renderer::createStaticResources() {
         bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
         bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
         VS_CHECK(dev_->CreateBlendState(&bd, &bsAdd_));
+        // Flames: premultiplied "over" - a flame adds its glow and also hides a little of what is behind it, so many flames
+        // on top of each other tend to their own colour instead of burning out to white.
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        VS_CHECK(dev_->CreateBlendState(&bd, &bsFire_));
         // Water: dual-source blend, result = water.add + background * water.mul (per-channel absorption).
         D3D11_BLEND_DESC wb = {};
         wb.RenderTarget[0].BlendEnable = TRUE;
@@ -479,6 +566,8 @@ bool Renderer::createStaticResources() {
         ld.ComparisonFunc = D3D11_COMPARISON_NEVER;
         ld.MaxLOD = D3D11_FLOAT32_MAX;
         VS_CHECK(dev_->CreateSamplerState(&ld, &sampLinear_));
+        ld.AddressU = ld.AddressV = ld.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        VS_CHECK(dev_->CreateSamplerState(&ld, &sampWrap_));
     }
     // Constant buffers.
     auto makeCB = [&](ComPtr<ID3D11Buffer>& b, UINT bytes) { return createDynamicBuffer(b, (bytes + 15) & ~15u, D3D11_BIND_CONSTANT_BUFFER); };
@@ -497,6 +586,11 @@ bool Renderer::createStaticResources() {
     chunkWater_.assign(chunkOpaque_.size(), GpuMesh());
     chunkTops_.assign(chunkOpaque_.size() * 1024, 0);
     waterTopMap_.assign((size_t)WaterField::W * WaterField::D, 0);
+    fxCap_ = fire::kMaxParticles + 1024;
+    if (!createDynamicBuffer(fxVB_, fxCap_ * (UINT)sizeof(FxInst), D3D11_BIND_VERTEX_BUFFER)) {
+        lastError = "fx buffer creation failed";
+        return false;
+    }
     lineCap_ = 8192 * 12;
     uiCap_ = 4096 * sizeof(UIVertex);
     if (!createDynamicBuffer(lineVB_, lineCap_, D3D11_BIND_VERTEX_BUFFER) || !createDynamicBuffer(uiVB_, uiCap_, D3D11_BIND_VERTEX_BUFFER)) {
@@ -521,9 +615,9 @@ bool Renderer::compile(const char* file, const char* entry, const char* target, 
 
 bool Renderer::createShaders(bool initial) {
     ComPtr<ID3DBlob> b;
-    ComPtr<ID3D11VertexShader> vsShadow, vsWorld, vsSky, vsLine, vsUI, vsView;
-    ComPtr<ID3D11PixelShader> psWorld, psWater, psUnder, psBlit, psSky, psLine, psUI, psView, psFlash;
-    ComPtr<ID3D11InputLayout> layWorld, layLine, layUI, layView;
+    ComPtr<ID3D11VertexShader> vsShadow, vsWorld, vsSky, vsLine, vsUI, vsView, vsFx;
+    ComPtr<ID3D11PixelShader> psWorld, psWater, psUnder, psBlit, psSky, psLine, psUI, psView, psFlash, psFire, psSmoke, psFireVol, psDepthMS, psDepth1;
+    ComPtr<ID3D11InputLayout> layWorld, layLine, layUI, layView, layFx;
     auto vs = [&](const char* f, const char* e, ComPtr<ID3D11VertexShader>& out, ComPtr<ID3DBlob>* keep = nullptr) {
         ComPtr<ID3DBlob> blob;
         if (!compile(f, e, "vs_5_0", blob)) return false;
@@ -536,12 +630,14 @@ bool Renderer::createShaders(bool initial) {
         if (!compile(f, e, "ps_5_0", blob)) return false;
         return SUCCEEDED(dev_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &out));
     };
-    ComPtr<ID3DBlob> bWorld, bLine, bUI, bView;
+    ComPtr<ID3DBlob> bWorld, bLine, bUI, bView, bFx;
     bool ok = vs("world.hlsl", "VSShadow", vsShadow) && vs("world.hlsl", "VSWorld", vsWorld, &bWorld) &&
               vs("sky.hlsl", "VSSky", vsSky) && vs("line.hlsl", "VSLine", vsLine, &bLine) && vs("ui.hlsl", "VSUI", vsUI, &bUI) &&
               vs("viewmodel.hlsl", "VSView", vsView, &bView) && ps("world.hlsl", "PSWorld", psWorld) &&
               ps("world.hlsl", "PSWater", psWater) && ps("sky.hlsl", "PSUnderwater", psUnder) && ps("sky.hlsl", "PSBlit", psBlit) && ps("sky.hlsl", "PSSky", psSky) && ps("line.hlsl", "PSLine", psLine) &&
-              ps("ui.hlsl", "PSUI", psUI) && ps("viewmodel.hlsl", "PSView", psView) && ps("viewmodel.hlsl", "PSFlash", psFlash);
+              ps("ui.hlsl", "PSUI", psUI) && ps("viewmodel.hlsl", "PSView", psView) && ps("viewmodel.hlsl", "PSFlash", psFlash) &&
+              vs("fx.hlsl", "VSFx", vsFx, &bFx) && ps("fx.hlsl", "PSFire", psFire) && ps("fx.hlsl", "PSSmoke", psSmoke) &&
+              ps("firevol.hlsl", "PSFireVol", psFireVol) && ps("depth_ms.hlsl", "PSDepthMS", psDepthMS) && ps("depth_1.hlsl", "PSDepth1", psDepth1);
     if (!ok) return false;
 
     const D3D11_INPUT_ELEMENT_DESC worldDesc[] = {
@@ -560,7 +656,13 @@ bool Renderer::createShaders(bool initial) {
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    if (FAILED(dev_->CreateInputLayout(worldDesc, 3, bWorld->GetBufferPointer(), bWorld->GetBufferSize(), &layWorld)) ||
+    const D3D11_INPUT_ELEMENT_DESC fxDesc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 20, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+    };
+    if (FAILED(dev_->CreateInputLayout(fxDesc, 3, bFx->GetBufferPointer(), bFx->GetBufferSize(), &layFx)) ||
+        FAILED(dev_->CreateInputLayout(worldDesc, 3, bWorld->GetBufferPointer(), bWorld->GetBufferSize(), &layWorld)) ||
         FAILED(dev_->CreateInputLayout(lineDesc, 1, bLine->GetBufferPointer(), bLine->GetBufferSize(), &layLine)) ||
         FAILED(dev_->CreateInputLayout(uiDesc, 3, bUI->GetBufferPointer(), bUI->GetBufferSize(), &layUI)) ||
         FAILED(dev_->CreateInputLayout(viewDesc, 3, bView->GetBufferPointer(), bView->GetBufferSize(), &layView))) {
@@ -570,6 +672,8 @@ bool Renderer::createShaders(bool initial) {
     vsShadow_ = vsShadow; vsWorld_ = vsWorld; vsSky_ = vsSky; vsLine_ = vsLine; vsUI_ = vsUI; vsView_ = vsView;
     psWorld_ = psWorld; psWater_ = psWater; psUnder_ = psUnder; psBlit_ = psBlit; psSky_ = psSky; psLine_ = psLine; psUI_ = psUI; psView_ = psView; psFlash_ = psFlash;
     layWorld_ = layWorld; layLine_ = layLine; layUI_ = layUI; layView_ = layView;
+    vsFx_ = vsFx; psFire_ = psFire; psSmoke_ = psSmoke; layFx_ = layFx;
+    psFireVol_ = psFireVol; psDepthMS_ = psDepthMS; psDepth1_ = psDepth1;
 
     if (initial) {
         // Rifle geometry buffers.
@@ -1056,6 +1160,260 @@ void Renderer::drawParticles() {
     ctx_->DrawIndexedInstanced(partIndexCount_, 1, 0, 0, (UINT)chunkOpaque_.size() * 2);  // (zero translation)
 }
 
+// ------------------------------------------------------------------------------------------------
+// Flames, sparks and smoke: camera-facing sprites (see fx.hlsl). Smoke is alpha blended and sorted far to near; flames and
+// sparks are added on top.
+// ------------------------------------------------------------------------------------------------
+void Renderer::buildFx(const Game& g) {
+    fxInst_.clear();
+    fxSmoke_ = fxFire_ = 0;
+    if (g.fx.empty()) return;
+    auto smoothstep = [](float a, float b, float x) {
+        const float t = clampf((x - a) / (b - a), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    static std::vector<std::pair<float, uint32_t>> order;
+    order.clear();
+    for (uint32_t i = 0; i < (uint32_t)g.fx.size(); i++) {
+        const FxParticle& f = g.fx[i];
+        if (f.kind == FX_FLAME || f.kind == FX_EMBER) continue;
+        order.emplace_back(lengthSq(f.pos - eye_), i);
+    }
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    const size_t cap = (size_t)fxCap_;
+    for (const auto& o : order) {
+        if (fxInst_.size() >= cap) break;
+        const FxParticle& f = g.fx[o.second];
+        const float t = clampf(f.age / f.life, 0.0f, 1.0f);
+        const float size = f.size + (f.size * 2.6f + 9.0f) * std::pow(t, 0.55f);
+        float r = 0.50f, gr = 0.50f, b = 0.53f, a = 0.5f;
+        if (f.kind == FX_STEAM) { r = 0.86f; gr = 0.89f; b = 0.93f; a = 0.42f; }
+        else if (f.kind == FX_SOOT) { r = 0.12f; gr = 0.115f; b = 0.12f; a = 0.66f; }
+        const float lift = 1.0f + 0.3f * t;  // smoke lightens as it thins
+        a *= smoothstep(0.0f, 0.10f, t) * (1.0f - smoothstep(0.42f, 1.0f, t)) * clampf(f.strength, 0.5f, 1.3f);
+        FxInst in = {f.pos.x, f.pos.y, f.pos.z, size * 0.5f, packColor(r * lift, gr * lift, b * lift, a), f.seed * 6.2831853f + t * (f.seed - 0.5f) * 0.8f, 2.0f, 0};
+        fxInst_.push_back(in);
+    }
+    fxSmoke_ = (UINT)fxInst_.size();
+    for (const FxParticle& f : g.fx) {
+        if (f.kind != FX_EMBER) continue;  // (flames are drawn by the fire volume, see buildFireHeat / firevol.hlsl)
+        if (fxInst_.size() >= cap) break;
+        const float t = clampf(f.age / f.life, 0.0f, 1.0f);
+        FxInst in;
+        if (f.kind == FX_FLAME) {
+            float r, gr, b;
+            if (t < 0.2f) {
+                const float k = t / 0.2f;
+                r = 1.0f; gr = 0.95f + (0.60f - 0.95f) * k; b = 0.70f + (0.16f - 0.70f) * k;
+            } else {
+                const float k = (t - 0.2f) / 0.8f;
+                r = 1.0f + (0.80f - 1.0f) * k; gr = 0.60f + (0.14f - 0.60f) * k; b = 0.16f + (0.03f - 0.16f) * k;
+            }
+            const float a = smoothstep(0.0f, 0.08f, t) * (1.0f - smoothstep(0.35f, 1.0f, t)) * 0.8f * (0.75f + 0.25f * clampf(f.strength, 0.0f, 1.6f));
+            const float size = f.size * (1.0f - 0.62f * t);
+            in = {f.pos.x, f.pos.y, f.pos.z, size * 0.5f, packColor(r, gr, b, a), f.seed * 6.2831853f, 0.0f, 0};
+        } else {
+            const float r = 1.0f, gr = 0.85f + (0.30f - 0.85f) * t, b = 0.45f + (0.06f - 0.45f) * t;
+            const float a = std::pow(1.0f - t, 0.6f);
+            in = {f.pos.x, f.pos.y, f.pos.z, f.size * 1.1f, packColor(r, gr, b, a), 0.0f, 1.0f, 0};
+        }
+        fxInst_.push_back(in);
+    }
+    fxFire_ = (UINT)fxInst_.size() - fxSmoke_;
+}
+
+void Renderer::drawFx() {
+    if (fxInst_.empty()) return;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx_->Map(fxVB_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    memcpy(m.pData, fxInst_.data(), fxInst_.size() * sizeof(FxInst));
+    ctx_->Unmap(fxVB_.Get(), 0);
+    const UINT stride = sizeof(FxInst), offset = 0;
+    ctx_->IASetInputLayout(layFx_.Get());
+    ctx_->IASetVertexBuffers(0, 1, fxVB_.GetAddressOf(), &stride, &offset);
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx_->VSSetShader(vsFx_.Get(), nullptr, 0);
+    ctx_->RSSetState(rsNoCull_.Get());
+    ctx_->OMSetDepthStencilState(dsLessNoWrite_.Get(), 0);
+    if (fxSmoke_) {
+        ctx_->PSSetShader(psSmoke_.Get(), nullptr, 0);
+        ctx_->OMSetBlendState(bsAlpha_.Get(), nullptr, 0xFFFFFFFF);
+        ctx_->DrawInstanced(4, fxSmoke_, 0, 0);
+    }
+    if (fxFire_) {
+        ctx_->PSSetShader(psFire_.Get(), nullptr, 0);
+        ctx_->OMSetBlendState(bsFire_.Get(), nullptr, 0xFFFFFFFF);
+        ctx_->DrawInstanced(4, fxFire_, 0, fxSmoke_);
+    }
+    ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+    ctx_->RSSetState(rsSolid_.Get());
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx_->IASetInputLayout(layWorld_.Get());
+    ctx_->VSSetShader(vsWorld_.Get(), nullptr, 0);
+    const UINT offStride = 2 * sizeof(float), offOffset = 0;  // (the chunk translations go back into slot 1)
+    ctx_->IASetVertexBuffers(1, 1, chunkOffVB_.GetAddressOf(), &offStride, &offOffset);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Fire volume. The CPU only says where there is fuel burning: a coarse heat field (one texel per 4 voxels) with a column of heat
+// rising from every flame source (a burning coal / oil voxel with air above or beside it, a burning coal rock, a painted flame),
+// taller and hotter for oil. firevol.hlsl does the rest.
+// ------------------------------------------------------------------------------------------------
+void Renderer::buildFireHeat(const Game& g) {
+    const int C = kHeatCell;
+    auto hidx = [&](int x, int y, int z) { return (size_t)x + (size_t)kHX * ((size_t)y + (size_t)kHY * (size_t)z); };
+    // forget what was written last frame
+    const int pmn[3] = {heatMin_[0], heatMin_[1], heatMin_[2]}, pmx[3] = {heatMax_[0], heatMax_[1], heatMax_[2]};
+    if (pmx[0] >= pmn[0])
+        for (int z = pmn[2]; z <= pmx[2]; z++)
+            for (int y = pmn[1]; y <= pmx[1]; y++) std::memset(&heat_[hidx(pmn[0], y, z)], 0, (size_t)(pmx[0] - pmn[0] + 1));
+    int mn[3] = {1 << 20, 1 << 20, 1 << 20}, mx[3] = {-1, -1, -1};
+    auto put = [&](int cx, int cy, int cz, float v) {
+        if ((unsigned)cx >= (unsigned)kHX || (unsigned)cy >= (unsigned)kHY || (unsigned)cz >= (unsigned)kHZ) return;
+        const int b = (int)(v * 255.0f + 0.5f);
+        if (b <= 0) return;
+        uint8_t& r = heat_[hidx(cx, cy, cz)];
+        if (b > r) r = (uint8_t)std::min(b, 255);
+        mn[0] = std::min(mn[0], cx); mn[1] = std::min(mn[1], cy); mn[2] = std::min(mn[2], cz);
+        mx[0] = std::max(mx[0], cx); mx[1] = std::max(mx[1], cy); mx[2] = std::max(mx[2], cz);
+    };
+
+    // 1. sources: one per column of heat texels (the highest one counts), so thousands of burning voxels cost the same as a few
+    ++heatStamp_;
+    colList_.clear();
+    auto source = [&](float px, float py, float pz, float s) {
+        const int cx = floorToInt(px / (float)C), cz = floorToInt(pz / (float)C);
+        if ((unsigned)cx >= (unsigned)kHX || (unsigned)cz >= (unsigned)kHZ) return;
+        const size_t col = (size_t)cx + (size_t)kHX * (size_t)cz;
+        if (colStamp_[col] != heatStamp_) {
+            colStamp_[col] = heatStamp_;
+            colStr_[col] = s;
+            colY_[col] = py;
+            colList_.push_back((int)col);
+        } else if (py > colY_[col] + 0.5f) {
+            colY_[col] = py;
+            colStr_[col] = std::max(s, colStr_[col] * 0.6f);
+        } else if (s > colStr_[col]) {
+            colStr_[col] = s;
+        }
+    };
+    const World& w = g.world;
+    {
+        const size_t n = w.burning.size();
+        const size_t stride = n > 30000 ? n / 30000 + 1 : 1;
+        for (size_t i = (size_t)(frameIndex_ % stride); i < n; i += stride) {
+            int x, y, z;
+            unpackCell(w.burning[i].cell, x, y, z);
+            const uint8_t m = w.get(x, y, z);
+            if (m != M_BCOAL && m != M_BOIL) continue;
+            const float fresh = std::max(0.0f, 1.0f - w.burning[i].age / 0.9f);  // a fire that has just caught flares up: the wave front stands tall
+            const float s0 = (m == M_BOIL ? 1.5f : 0.9f) * (1.0f + 0.9f * fresh * fresh);
+            if (w.get(x, y + 1, z) == M_AIR) {
+                source(x + 0.5f, (float)(y + 1), z + 0.5f, s0);
+            } else {
+                static const int dd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (const auto& d : dd)
+                    if (w.get(x + d[0], y, z + d[1]) == M_AIR) {
+                        source(x + 0.5f + d[0], (float)y, z + 0.5f + d[1], s0 * 0.6f);
+                        break;
+                    }
+            }
+        }
+    }
+    for (auto& up : g.physics.bodies) {  // burning rocks
+        const Body& b = *up;
+        if (b.burn.empty()) continue;
+        const size_t stride = b.burn.size() > 3000 ? b.burn.size() / 3000 + 1 : 1;
+        for (size_t i = (size_t)(frameIndex_ % stride); i < b.burn.size(); i += stride) {
+            const BodyBurn& bb = b.burn[i];
+            if (bb.left <= 0) continue;
+            const Vec3 wp = b.latticeToWorld(Vec3((float)bb.i + 0.5f, (float)bb.j + 0.5f, (float)bb.k + 0.5f));
+            const Vec3 above = wp + Vec3(0, 1.3f, 0);
+            if (g.world.playerSolid(floorToInt(above.x), floorToInt(above.y), floorToInt(above.z))) continue;  // covered
+            source(above.x, above.y, above.z, 0.8f);
+        }
+    }
+    for (int col : colList_) {  // a column of heat from each source: strongest at the foot, fading to nothing at the tip
+        const float s = std::min(colStr_[(size_t)col], 2.5f);
+        const int cx = col % kHX, cz = col / kHX, cy0 = floorToInt(colY_[(size_t)col] / (float)C);
+        const int hc = 1 + (int)((10.0f + 14.0f * s) / (float)C + 0.5f);
+        for (int k = 0; k <= hc; k++) {
+            const float u = (float)k / (float)(hc + 1);
+            const float v = s * (1.0f - u) * (1.0f - 0.35f * u);
+            put(cx, cy0 + k, cz, v);
+            put(cx + 1, cy0 + k, cz, v * 0.6f); put(cx - 1, cy0 + k, cz, v * 0.6f);
+            put(cx, cy0 + k, cz + 1, v * 0.6f); put(cx, cy0 + k, cz - 1, v * 0.6f);
+            put(cx + 1, cy0 + k, cz + 1, v * 0.36f); put(cx - 1, cy0 + k, cz + 1, v * 0.36f);
+            put(cx + 1, cy0 + k, cz - 1, v * 0.36f); put(cx - 1, cy0 + k, cz - 1, v * 0.36f);
+        }
+    }
+    // 2. flames in flight (the Creator's fire, and what rises off the burning fuel): the tips that lick up past the columns
+    for (const FxParticle& f : g.fx) {
+        if (f.kind != FX_FLAME || f.age >= f.life) continue;
+        const float life01 = f.age / f.life;
+        const float v = std::min(1.0f, f.strength * 0.8f) * (1.0f - life01) * std::min(1.0f, life01 * 8.0f + 0.2f);
+        const int cx = floorToInt(f.pos.x / (float)C), cy = floorToInt(f.pos.y / (float)C), cz = floorToInt(f.pos.z / (float)C);
+        put(cx, cy, cz, v);
+        put(cx + 1, cy, cz, v * 0.5f); put(cx - 1, cy, cz, v * 0.5f);
+        put(cx, cy, cz + 1, v * 0.5f); put(cx, cy, cz - 1, v * 0.5f);
+        put(cx, cy + 1, cz, v * 0.45f);
+    }
+
+    // 3. upload what changed (this frame's texels and last frame's, which were cleared)
+    fireActive_ = mx[0] >= mn[0];
+    int umn[3], umx[3];
+    bool any = false;
+    for (int a = 0; a < 3; a++) {
+        umn[a] = std::min(mn[a], pmn[a]);
+        umx[a] = std::max(mx[a], pmx[a]);
+        any |= umx[a] >= umn[a];
+    }
+    if (any) {
+        const D3D11_BOX box = {(UINT)umn[0], (UINT)umn[1], (UINT)umn[2], (UINT)umx[0] + 1, (UINT)umx[1] + 1, (UINT)umx[2] + 1};
+        ctx_->UpdateSubresource(heatTex_.Get(), 0, &box, &heat_[hidx(umn[0], umn[1], umn[2])], (UINT)kHX, (UINT)(kHX * kHY));
+    }
+    for (int a = 0; a < 3; a++) {
+        heatMin_[a] = mn[a];
+        heatMax_[a] = mx[a];
+    }
+    if (fireActive_) {  // the box the shader marches through: the heat texels, with room for the flames' sway
+        fireBoxMin_ = Vec3((float)(mn[0] * C) - 12.0f, (float)(mn[1] * C) - 2.0f, (float)(mn[2] * C) - 12.0f);
+        fireBoxMax_ = Vec3((float)((mx[0] + 1) * C) + 12.0f, (float)((mx[1] + 1) * C) + 8.0f, (float)((mx[2] + 1) * C) + 12.0f);
+    }
+}
+
+void Renderer::drawFireVolume() {
+    if (!fireActive_) return;
+    // 1. the scene's depth, one value per pixel
+    ID3D11RenderTargetView* rt = fireDepthRTV_.Get();
+    ctx_->OMSetRenderTargets(1, &rt, nullptr);
+    ctx_->IASetInputLayout(nullptr);
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx_->VSSetShader(vsSky_.Get(), nullptr, 0);
+    ctx_->PSSetShader(sampleCount_ > 1 ? psDepthMS_.Get() : psDepth1_.Get(), nullptr, 0);
+    ctx_->OMSetDepthStencilState(dsOff_.Get(), 0);
+    ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+    ctx_->RSSetState(rsNoCull_.Get());
+    ctx_->PSSetShaderResources(7, 1, msaaDepthSRV_.GetAddressOf());
+    ctx_->Draw(3, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    ctx_->PSSetShaderResources(7, 1, &none);
+    // 2. the flames, added over the picture
+    ctx_->OMSetRenderTargets(1, msaaRTV_.GetAddressOf(), msaaDSV_.Get());
+    ID3D11ShaderResourceView* srvs[3] = {heatSRV_.Get(), noiseSRV_.Get(), fireDepthSRV_.Get()};
+    ctx_->PSSetShaderResources(5, 3, srvs);
+    ctx_->PSSetSamplers(2, 1, sampWrap_.GetAddressOf());
+    ctx_->PSSetShader(psFireVol_.Get(), nullptr, 0);
+    ctx_->OMSetBlendState(bsFire_.Get(), nullptr, 0xFFFFFFFF);
+    ctx_->Draw(3, 0);
+    ID3D11ShaderResourceView* nulls[3] = {nullptr, nullptr, nullptr};
+    ctx_->PSSetShaderResources(5, 3, nulls);
+    ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+    ctx_->RSSetState(rsSolid_.Get());
+    ctx_->IASetInputLayout(layWorld_.Get());
+    ctx_->VSSetShader(vsWorld_.Get(), nullptr, 0);
+}
+
 // Wireframe sphere: the Creator's brush indicator (material coloured) or the Gun's carve preview (red).
 void Renderer::drawBrush(const Game& g) {
     if (!g.preview.valid) return;
@@ -1069,6 +1427,10 @@ void Renderer::drawBrush(const Game& g) {
             case M_STONE: col[0] = 0.92f; col[1] = 0.92f; col[2] = 0.96f; break;
             case M_DIRT: col[0] = 0.62f; col[1] = 0.42f; col[2] = 0.24f; break;
             case M_GRASS: col[0] = 0.35f; col[1] = 0.85f; col[2] = 0.25f; break;
+            case M_COAL: col[0] = 0.55f; col[1] = 0.55f; col[2] = 0.62f; break;
+            case M_FIRE: col[0] = 1.0f; col[1] = 0.55f; col[2] = 0.12f; break;
+            case M_SMOKE: col[0] = 0.78f; col[1] = 0.80f; col[2] = 0.84f; break;
+            case M_OIL: col[0] = 0.62f; col[1] = 0.45f; col[2] = 0.15f; break;
             default: col[0] = 0.72f; col[1] = 0.45f; col[2] = 1.0f; break;
         }
     }
@@ -1177,7 +1539,7 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
     hud.push_back(b);
     if (g.tool == TOOL_CREATOR) {
         hud.push_back("TOOL      [R] CREATOR  -  place / attach voxels");
-        snprintf(b, sizeof(b), "MATERIAL  %s   (1 sand  2 water  3 stone  4 permanent  5 dirt  6 grass)", materialName(g.currentMaterial()));
+        snprintf(b, sizeof(b), "MATERIAL  %s", materialName(g.currentMaterial()));
         hud.push_back(b);
     } else {
         hud.push_back("TOOL      [F] GUN  -  carve voxels, split islands");
@@ -1197,6 +1559,11 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
     snprintf(b, sizeof(b), "BODIES    %zu (%zu awake)   SAND %lld  WATER %lld  DIRT %lld  GRASS %lld", g.physics.bodies.size(), awake, g.world.counts[M_SAND],
              g.world.counts[M_WATER], g.world.counts[M_DIRT], g.world.counts[M_GRASS]);
     hud.push_back(b);
+    if (g.world.counts[M_COAL] + g.world.counts[M_BCOAL] + g.world.counts[M_OIL] + g.world.counts[M_BOIL] > 0 || !g.fx.empty()) {
+        snprintf(b, sizeof(b), "FIRE      COAL %lld (%lld burning)   OIL %lld (%lld burning)   flames %zu   smoke %zu", g.world.counts[M_COAL] + g.world.counts[M_BCOAL],
+                 g.world.counts[M_BCOAL], g.world.counts[M_OIL] + g.world.counts[M_BOIL], g.world.counts[M_BOIL], g.flameCount(), g.smokeCount());
+        hud.push_back(b);
+    }
     snprintf(b, sizeof(b), "RENDER    quality %s tier %d (%.0f%% res, %d rays, water %d)   chunks %d   meshing %.1f ms", quality < 0 ? "auto" : "fixed", tier_, renderScale_ * 100.0f, kTiers[tier_].rays, kTiers[tier_].water, stats.chunksDrawn, stats.meshMs);
     hud.push_back(b);
 
@@ -1217,7 +1584,8 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
     }
     if (showHelp) {
         help.push_back("WASD move   SPACE jump   SHIFT sprint   MOUSE look   ESC release mouse");
-        help.push_back("R creator   F gun   1-4 or Q/E material   WHEEL brush size   LMB paint / fire");
+        help.push_back("R creator   F gun   WHEEL brush size   LMB paint / fire   Q / E cycle the material");
+        help.push_back("1 sand  2 water  3 stone  4 permanent  5 dirt  6 grass  7 coal  8 fire  9 smoke  0 oil");
         help.push_back("[ ] sun azimuth   ; ' sun height   F1 help   F2 screenshot   F3 HUD");
         help.push_back("F4 profiler   F5 reset world   F6 sky rays   F7 vsync   F8 MSAA   F9 reload shaders   F12 quality (auto / 0-4)");
     }
@@ -1309,7 +1677,9 @@ void Renderer::drawHud(const Game& g) {
         const float sw = 46, gapx = 10, total = (float)kPaintMaterialCount * sw + (float)(kPaintMaterialCount - 1) * gapx;
         const float x0 = W * 0.5f - total * 0.5f, y0 = H - 78;
         const uint32_t cols[kPaintMaterialCount] = {packColor(0.87f, 0.71f, 0.40f, 1), packColor(0.18f, 0.47f, 0.84f, 1), packColor(0.58f, 0.58f, 0.62f, 1),
-                                                    packColor(0.28f, 0.22f, 0.45f, 1), packColor(0.45f, 0.30f, 0.17f, 1), packColor(0.25f, 0.62f, 0.18f, 1)};
+                                                    packColor(0.28f, 0.22f, 0.45f, 1), packColor(0.45f, 0.30f, 0.17f, 1), packColor(0.25f, 0.62f, 0.18f, 1),
+                                                    packColor(0.10f, 0.10f, 0.12f, 1), packColor(1.0f, 0.52f, 0.10f, 1), packColor(0.68f, 0.70f, 0.75f, 1),
+                                                    packColor(0.24f, 0.16f, 0.05f, 1)};
         for (int i = 0; i < kPaintMaterialCount; i++) {
             const float x = x0 + (float)i * (sw + gapx);
             const bool sel = (i == g.materialIndex);
@@ -1523,6 +1893,21 @@ void Renderer::render(Game& g, float dt) {
         set4(fc.fogA, g.infinite ? 1.0f : 0.0f, 70.0f, 208.0f, 0);
         set4(fc.fogB, 0, (float)hx, (float)hz, g.infinite ? 1.0f : 0.0f);
     }
+    // glows of the flames
+    {
+        const size_t nl = std::min<size_t>((size_t)fire::kMaxLights, g.fireLights.size());
+        set4(fc.fireInfo, (float)nl, 0, 0, 0);
+        for (size_t i = 0; i < (size_t)fire::kMaxLights; i++) {
+            if (i < nl) set4(fc.fireLights[i], g.fireLights[i].pos.x, g.fireLights[i].pos.y, g.fireLights[i].pos.z, g.fireLights[i].radius);
+            else set4(fc.fireLights[i], 0, 0, 0, 0);
+        }
+    }
+    buildFx(g);
+    buildFireHeat(g);
+    set4(fc.fireBoxA, fireBoxMin_.x, fireBoxMin_.y, fireBoxMin_.z, (float)kHeatCell);
+    set4(fc.fireBoxB, fireBoxMax_.x, fireBoxMax_.y, fireBoxMax_.z, fireActive_ ? 1.0f : 0.0f);
+    set4(fc.fireGrid, (float)kHX, (float)kHY, (float)kHZ, (float)(tier_ >= 3 ? 56 : (tier_ == 2 ? 40 : 28)));
+    set4(fc.depthInfo, 0.4f, 3000.0f, (float)sceneW_, (float)sceneH_);
     // per-instance chunk translations (changes only when the window shifts or a chunk is rebuilt)
     if (chunkOffDirty_) {
         chunkOffDirty_ = false;
@@ -1621,6 +2006,8 @@ void Renderer::render(Game& g, float dt) {
     setObject(Mat4::identity(), 1, 1, 1, 1);
     drawChunks(true, &fr, 0.0f);
     ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
+    drawFx();
+    drawFireVolume();
 
     // Camera under water: tint the whole view (the water surface itself is not drawn from below).
     if (g.world.get(floorToInt(eye_.x), floorToInt(eye_.y), floorToInt(eye_.z)) == M_WATER) {
