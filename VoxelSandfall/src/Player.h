@@ -26,6 +26,7 @@ public:
     std::function<bool(const IVec3& mn, const IVec3& mx, int axis, int sign)> plowHook;
 
     void respawn();
+    void respawnAt(const Vec3& feet);  // standing still at `feet`, looking along -z
     void update(World& w, float dt, const PlayerInput& in);
 
     Vec3 eye() const { return pos + Vec3(0, cfg::PLAYER_EYE, 0); }

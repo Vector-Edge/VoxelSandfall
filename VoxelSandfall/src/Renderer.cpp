@@ -19,6 +19,7 @@ struct FrameCB {
     Mat4 viewProj, lightViewProj;
     float camPos[4], sunDir[4], sunColor[4], skyZenith[4], skyHorizon[4], groundCol[4];
     float params[4], gridDims[4], camRight[4], camUp[4], camFwd[4], qual[4];
+    float fogA[4], fogB[4], skyView[4];
 };
 struct ObjectCB {
     Mat4 model;
@@ -383,11 +384,15 @@ bool Renderer::createStaticResources() {
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         VS_CHECK(dev_->CreateTexture3D(&td, nullptr, &occTex_));
         VS_CHECK(dev_->CreateShaderResourceView(occTex_.Get(), nullptr, &occSRV_));
+        VS_CHECK(dev_->CreateTexture3D(&td, nullptr, &occTexB_));
+        VS_CHECK(dev_->CreateShaderResourceView(occTexB_.Get(), nullptr, &occSRVB_));
         td.Width = cfg::WORLD_X / 8;
         td.Height = cfg::WORLD_Y / 8;
         td.Depth = cfg::WORLD_Z / 8;
         VS_CHECK(dev_->CreateTexture3D(&td, nullptr, &brickTex_));
         VS_CHECK(dev_->CreateShaderResourceView(brickTex_.Get(), nullptr, &brickSRV_));
+        VS_CHECK(dev_->CreateTexture3D(&td, nullptr, &brickTexB_));
+        VS_CHECK(dev_->CreateShaderResourceView(brickTexB_.Get(), nullptr, &brickSRVB_));
     }
     // Water surface field (ripples, foam, smoothed slope): RGBA16F, one texel per world column.
     {
@@ -483,6 +488,12 @@ bool Renderer::createStaticResources() {
         return false;
     }
     chunkOpaque_.assign((size_t)cfg::WORLD_X / 32 * (cfg::WORLD_Y / 32) * (cfg::WORLD_Z / 32), GpuMesh());
+    chunkOff_.assign((chunkOpaque_.size() * 2 + 1) * 2, 0.0f);  // per chunk (x, z) translation: opaque meshes, water meshes, one zero entry
+    if (!createDynamicBuffer(chunkOffVB_, (UINT)(chunkOff_.size() * sizeof(float)), D3D11_BIND_VERTEX_BUFFER)) {
+        lastError = "chunk offset buffer creation failed";
+        return false;
+    }
+    chunkOffDirty_ = true;
     chunkWater_.assign(chunkOpaque_.size(), GpuMesh());
     chunkTops_.assign(chunkOpaque_.size() * 1024, 0);
     waterTopMap_.assign((size_t)WaterField::W * WaterField::D, 0);
@@ -536,6 +547,7 @@ bool Renderer::createShaders(bool initial) {
     const D3D11_INPUT_ELEMENT_DESC worldDesc[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"ATTR", 0, DXGI_FORMAT_R32_UINT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"CHUNKOFF", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
     };
     const D3D11_INPUT_ELEMENT_DESC lineDesc[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0}};
     const D3D11_INPUT_ELEMENT_DESC uiDesc[] = {
@@ -548,7 +560,7 @@ bool Renderer::createShaders(bool initial) {
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    if (FAILED(dev_->CreateInputLayout(worldDesc, 2, bWorld->GetBufferPointer(), bWorld->GetBufferSize(), &layWorld)) ||
+    if (FAILED(dev_->CreateInputLayout(worldDesc, 3, bWorld->GetBufferPointer(), bWorld->GetBufferSize(), &layWorld)) ||
         FAILED(dev_->CreateInputLayout(lineDesc, 1, bLine->GetBufferPointer(), bLine->GetBufferSize(), &layLine)) ||
         FAILED(dev_->CreateInputLayout(uiDesc, 3, bUI->GetBufferPointer(), bUI->GetBufferSize(), &layUI)) ||
         FAILED(dev_->CreateInputLayout(viewDesc, 3, bView->GetBufferPointer(), bView->GetBufferSize(), &layView))) {
@@ -671,37 +683,123 @@ void Renderer::uploadDynamic(ComPtr<ID3D11Buffer>& vb, ComPtr<ID3D11Buffer>& ib,
     indexCount = (UINT)md.idx.size();
 }
 
+static bool isChunkEmpty(const uint8_t* c) {
+    const uint64_t* w = (const uint64_t*)c;
+    for (size_t i = 0; i < 4096; i++)
+        if (w[i]) return false;
+    return true;
+}
+
+void Renderer::resetChunkGpu() {
+    for (auto& m : chunkOpaque_) m = GpuMesh();
+    for (auto& m : chunkWater_) m = GpuMesh();
+    std::fill(chunkTops_.begin(), chunkTops_.end(), (uint8_t)0);
+    std::fill(waterTopMap_.begin(), waterTopMap_.end(), (uint16_t)0);
+    chunkOffDirty_ = true;
+    topsDirty_ = true;
+    topsX0_ = topsZ0_ = 0;
+    topsX1_ = WaterField::W - 1;
+    topsZ1_ = WaterField::D - 1;
+    firstBuild_ = true;  // everything is rebuilt at once
+    sceneDirty_ = true;
+}
+
+// The window of the infinite world moved by (dRx, dRz) regions: local coordinates of everything that stays moved by
+// -(dRx, dRz) * REGION. World has already permuted its per-chunk flags; this does the same to the GPU side - nothing is copied
+// through the CPU: the retained part of the volume textures is copied on the GPU, the meshes are kept as they are (and drawn
+// translated until they are rebuilt, a few at a time), and only the newly loaded regions are meshed and uploaded.
+void Renderer::applyShift(Game& g, int dRx, int dRz) {
+    World& w = g.world;
+    const int R = World::REGION, RC = World::REGION_CHUNKS;
+    const int dx = dRx * R, dz = dRz * R;
+    const int x0 = std::max(0, dx), x1 = std::min(cfg::WORLD_X, cfg::WORLD_X + dx);
+    const int z0 = std::max(0, dz), z1 = std::min(cfg::WORLD_Z, cfg::WORLD_Z + dz);
+    if (x1 > x0 && z1 > z0) {
+        const D3D11_BOX box = {(UINT)x0, 0, (UINT)z0, (UINT)x1, (UINT)cfg::WORLD_Y, (UINT)z1};
+        ctx_->CopySubresourceRegion(occTexB_.Get(), 0, (UINT)(x0 - dx), 0, (UINT)(z0 - dz), occTex_.Get(), 0, &box);
+        const D3D11_BOX bb = {(UINT)(x0 / 8), 0, (UINT)(z0 / 8), (UINT)(x1 / 8), (UINT)(cfg::WORLD_Y / 8), (UINT)(z1 / 8)};
+        ctx_->CopySubresourceRegion(brickTexB_.Get(), 0, (UINT)((x0 - dx) / 8), 0, (UINT)((z0 - dz) / 8), brickTex_.Get(), 0, &bb);
+    }
+    std::swap(occTex_, occTexB_);
+    std::swap(occSRV_, occSRVB_);
+    std::swap(brickTex_, brickTexB_);
+    std::swap(brickSRV_, brickSRVB_);
+    {  // the regions that came into view start empty (one upload each); only their non-empty chunks are uploaded afterwards
+        static std::vector<uint8_t> zeros;
+        zeros.assign((size_t)R * cfg::WORLD_Y * R, 0);
+        for (int rzl = 0; rzl < World::WIN_REGIONS; rzl++)
+            for (int rxl = 0; rxl < World::WIN_REGIONS; rxl++) {
+                const int orx = rxl + dRx, orz = rzl + dRz;
+                if (orx >= 0 && orx < World::WIN_REGIONS && orz >= 0 && orz < World::WIN_REGIONS) continue;
+                const D3D11_BOX b = {(UINT)(rxl * R), 0, (UINT)(rzl * R), (UINT)((rxl + 1) * R), (UINT)cfg::WORLD_Y, (UINT)((rzl + 1) * R)};
+                ctx_->UpdateSubresource(occTex_.Get(), 0, &b, zeros.data(), (UINT)R, (UINT)R * cfg::WORLD_Y);
+                const D3D11_BOX bb = {(UINT)(rxl * R / 8), 0, (UINT)(rzl * R / 8), (UINT)((rxl + 1) * R / 8), (UINT)(cfg::WORLD_Y / 8), (UINT)((rzl + 1) * R / 8)};
+                ctx_->UpdateSubresource(brickTex_.Get(), 0, &bb, zeros.data(), (UINT)(R / 8), (UINT)(R / 8) * (cfg::WORLD_Y / 8));
+            }
+    }
+
+    const int CX = w.CX, CY = w.CY, CZ = w.CZ;
+    auto permuteMeshes = [&](std::vector<GpuMesh>& v) {
+        std::vector<GpuMesh> nv(v.size());
+        for (int cz = 0; cz < CZ; cz++)
+            for (int cy = 0; cy < CY; cy++)
+                for (int cx = 0; cx < CX; cx++) {
+                    const int ox = cx + RC * dRx, oz = cz + RC * dRz;
+                    if (ox < 0 || ox >= CX || oz < 0 || oz >= CZ) continue;
+                    GpuMesh& dst = nv[(size_t)w.chunkIndex(cx, cy, cz)];
+                    dst = std::move(v[(size_t)w.chunkIndex(ox, cy, oz)]);
+                    dst.sx -= (float)dx;
+                    dst.sz -= (float)dz;
+                }
+        v.swap(nv);
+    };
+    permuteMeshes(chunkOpaque_);
+    permuteMeshes(chunkWater_);
+    {
+        std::vector<uint8_t> nt(chunkTops_.size(), 0);
+        for (int cz = 0; cz < CZ; cz++)
+            for (int cy = 0; cy < CY; cy++)
+                for (int cx = 0; cx < CX; cx++) {
+                    const int ox = cx + RC * dRx, oz = cz + RC * dRz;
+                    if (ox < 0 || ox >= CX || oz < 0 || oz >= CZ) continue;
+                    std::memcpy(&nt[(size_t)w.chunkIndex(cx, cy, cz) * 1024], &chunkTops_[(size_t)w.chunkIndex(ox, cy, oz) * 1024], 1024);
+                }
+        chunkTops_.swap(nt);
+    }
+    // The meshes that were kept are NOT rebuilt: they keep their vertices and are drawn translated (per-instance data), until
+    // something changes in them and they are meshed again. Only the water surface heights of the new strip are missing.
+    chunkOffDirty_ = true;
+    {
+        const int W = World::WIN_REGIONS;
+        auto touch = [&](int x0, int z0, int x1, int z1) {
+            topsDirty_ = true;
+            topsX0_ = std::min(topsX0_, x0);
+            topsZ0_ = std::min(topsZ0_, z0);
+            topsX1_ = std::max(topsX1_, x1);
+            topsZ1_ = std::max(topsZ1_, z1);
+        };
+        if (dRx > 0) touch(std::max(0, (W - dRx) * R), 0, cfg::WORLD_X - 1, cfg::WORLD_Z - 1);
+        if (dRx < 0) touch(0, 0, std::min(cfg::WORLD_X, -dRx * R) - 1, cfg::WORLD_Z - 1);
+        if (dRz > 0) touch(0, std::max(0, (W - dRz) * R), cfg::WORLD_X - 1, cfg::WORLD_Z - 1);
+        if (dRz < 0) touch(0, 0, cfg::WORLD_X - 1, std::min(cfg::WORLD_Z, -dRz * R) - 1);
+    }
+    sceneDirty_ = true;
+}
+
 void Renderer::updateWorldGpu(Game& g) {
     World& w = g.world;
     const int n = w.chunkCount();
     const double t0 = nowMs();
+    if (epoch_ != w.epoch) {  // a different world (reset / arena <-> infinite): start the GPU side from scratch
+        epoch_ = w.epoch;
+        g.pendingShifts.clear();
+        resetChunkGpu();
+    }
+    for (const auto& sh : g.pendingShifts) applyShift(g, sh.first, sh.second);
+    g.pendingShifts.clear();
 
-    // Work is done in parallel batches until the frame's world-update budget (~6 ms) is spent; chunks that are
-    // still dirty simply wait for the next frame, so even a half-million-voxel pour cannot stall the frame.
     int rebuilds = 0, fullRebuilds = 0;
-    int cursor = rebuildCursor_;
-    int scanned = 0;
-    const double budgetMs = firstBuild_ ? 1e9 : 3.5;  // small slices: a big edit spreads over a few frames instead of one long hitch
-    while (scanned < n && nowMs() - t0 < budgetMs) {
-        size_t count = 0;
-        const size_t batch = firstBuild_ ? (size_t)n : 8;
-        while (scanned < n && count < batch) {
-            const int ci = cursor;
-            cursor = (cursor + 1) % n;
-            scanned++;
-            const bool tex = w.texDirty[ci] != 0, mesh = w.meshDirty[ci] != 0, wmesh = !mesh && w.waterDirty[ci] != 0;
-            if (!tex && !mesh && !wmesh) continue;
-            // Chunks where only water moved are refreshed every other frame (30 Hz is plenty for a flowing surface).
-            if (!mesh && ((unsigned)ci + (unsigned)frameIndex_) % 2u) continue;
-            if (work_.size() <= count) work_.emplace_back();
-            ChunkWork& cw = work_[count++];
-            cw.ci = ci;
-            cw.tex = tex;
-            cw.mesh = mesh;
-            cw.waterOnly = wmesh;
-        }
-        if (!count) break;
-
+    auto runBatch = [&](size_t count) {
         {  // brick occupancy + greedy meshing on all cores (the world is read-only here)
             prof::Scope sc(prof::P_MESH);
             auto job = [&](int k, int) {
@@ -724,7 +822,9 @@ void Renderer::updateWorldGpu(Game& g) {
         for (size_t k = 0; k < count; k++) {
             ChunkWork& cw = work_[k];
             const int cx = cw.ci % w.CX, cy = (cw.ci / w.CX) % w.CY, cz = cw.ci / (w.CX * w.CY);
-            if (cw.tex) {
+            if (cw.tex && cw.skipEmpty) {
+                w.texDirty[cw.ci] = 0;  // (a freshly loaded, empty chunk: the volume was cleared already)
+            } else if (cw.tex) {
                 D3D11_BOX box = {(UINT)cx * 32, (UINT)cy * 32, (UINT)cz * 32, (UINT)cx * 32 + 32, (UINT)cy * 32 + 32, (UINT)cz * 32 + 32};
                 ctx_->UpdateSubresource(occTex_.Get(), 0, &box, w.chunkData(cw.ci), 32, 1024);
                 D3D11_BOX bb = {(UINT)cx * 4, (UINT)cy * 4, (UINT)cz * 4, (UINT)cx * 4 + 4, (UINT)cy * 4 + 4, (UINT)cz * 4 + 4};
@@ -732,8 +832,13 @@ void Renderer::updateWorldGpu(Game& g) {
                 w.texDirty[cw.ci] = 0;
             }
             if (cw.mesh || cw.waterOnly) {
-                if (cw.mesh) uploadMesh(chunkOpaque_[cw.ci], cw.opaque);
+                if (cw.mesh) {
+                    uploadMesh(chunkOpaque_[cw.ci], cw.opaque);
+                    chunkOpaque_[cw.ci].sx = chunkOpaque_[cw.ci].sz = 0;
+                }
                 uploadMesh(chunkWater_[cw.ci], cw.water);
+                chunkWater_[cw.ci].sx = chunkWater_[cw.ci].sz = 0;
+                chunkOffDirty_ = true;
                 uint8_t* tops = &chunkTops_[(size_t)cw.ci * 1024];
                 if (std::memcmp(tops, cw.tops, 1024) != 0) {
                     std::memcpy(tops, cw.tops, 1024);
@@ -751,6 +856,58 @@ void Renderer::updateWorldGpu(Game& g) {
                 rebuilds++;
             }
         }
+    };
+
+    // Chunks of freshly loaded regions are needed right now (they are what the player is walking towards): done first and
+    // without a time budget.
+    {
+        size_t count = 0;
+        for (int ci = 0; ci < n; ci++) {
+            if (!w.chunkUrgent[(size_t)ci]) continue;
+            w.chunkUrgent[(size_t)ci] = 0;
+            const bool tex = w.texDirty[ci] != 0, mesh = w.meshDirty[ci] != 0;
+            if (!tex && !mesh) continue;
+            if (work_.size() <= count) work_.emplace_back();
+            ChunkWork& cw = work_[count++];
+            cw.ci = ci;
+            cw.tex = tex;
+            cw.mesh = mesh;
+            cw.waterOnly = false;
+            cw.skipEmpty = !firstBuild_ && tex && isChunkEmpty(w.chunkData(ci));
+            if (count == 96) {
+                runBatch(count);
+                count = 0;
+            }
+        }
+        if (count) runBatch(count);
+    }
+
+    // Everything else: in parallel batches until the frame's world-update budget is spent; chunks that are still dirty
+    // simply wait for the next frame, so even a half-million-voxel pour cannot stall the frame.
+    int cursor = rebuildCursor_;
+    int scanned = 0;
+    const double budgetMs = firstBuild_ ? 1e9 : 3.5;  // small slices: a big edit spreads over a few frames instead of one long hitch
+    while (scanned < n && nowMs() - t0 < budgetMs) {
+        size_t count = 0;
+        const size_t batch = firstBuild_ ? (size_t)n : 8;
+        while (scanned < n && count < batch) {
+            const int ci = cursor;
+            cursor = (cursor + 1) % n;
+            scanned++;
+            const bool tex = w.texDirty[ci] != 0, mesh = w.meshDirty[ci] != 0, wmesh = !mesh && w.waterDirty[ci] != 0;
+            if (!tex && !mesh && !wmesh) continue;
+            // Chunks where only water moved are refreshed every other frame (30 Hz is plenty for a flowing surface).
+            if (!mesh && ((unsigned)ci + (unsigned)frameIndex_) % 2u) continue;
+            if (work_.size() <= count) work_.emplace_back();
+            ChunkWork& cw = work_[count++];
+            cw.ci = ci;
+            cw.tex = tex;
+            cw.mesh = mesh;
+            cw.waterOnly = wmesh;
+            cw.skipEmpty = false;
+        }
+        if (!count) break;
+        runBatch(count);
     }
     rebuildCursor_ = cursor;
     if (fullRebuilds) sceneDirty_ = true;  // water is not in the shadow map: water-only rebuilds leave it alone
@@ -846,23 +1003,25 @@ void Renderer::drawSky() {
     ctx_->RSSetState(rsSolid_.Get());
 }
 
-void Renderer::drawChunks(bool water, const Frustum* fr) {
+void Renderer::drawChunks(bool water, const Frustum* fr, float volumeAO) {
     ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const UINT stride = sizeof(MeshVertex), offset = 0;
     const std::vector<GpuMesh>& meshes = water ? chunkWater_ : chunkOpaque_;
     const int CXn = cfg::WORLD_X / 32, CYn = cfg::WORLD_Y / 32;
     int drawn = 0;
+    (void)volumeAO;
+    const UINT instBase = water ? (UINT)meshes.size() : 0;  // where this layer's translations start in the per-instance buffer
     for (size_t ci = 0; ci < meshes.size(); ci++) {
         const GpuMesh& gm = meshes[ci];
         if (!gm.indexCount) continue;
         if (fr) {
             const int cx = (int)ci % CXn, cy = ((int)ci / CXn) % CYn, cz = (int)ci / (CXn * CYn);
-            const Vec3 mn((float)cx * 32, (float)cy * 32, (float)cz * 32);
+            const Vec3 mn((float)cx * 32, (float)cy * 32, (float)cz * 32);  // (logical position: a shifted mesh is drawn translated onto it)
             if (!aabbVisible(*fr, mn, mn + Vec3(32, 32, 32))) continue;
         }
         ctx_->IASetVertexBuffers(0, 1, gm.vb.GetAddressOf(), &stride, &offset);
         ctx_->IASetIndexBuffer(gm.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
-        ctx_->DrawIndexed(gm.indexCount, 0, 0);
+        ctx_->DrawIndexedInstanced(gm.indexCount, 1, 0, 0, instBase + (UINT)ci);  // (the per-instance data is this chunk's translation)
         drawn++;
     }
     if (!water && fr) stats.chunksDrawn = drawn;
@@ -881,7 +1040,7 @@ void Renderer::drawBodies(const Game& g) {
         setObject(m, 1, 1, 1, 1);
         ctx_->IASetVertexBuffers(0, 1, it->second.mesh.vb.GetAddressOf(), &stride, &offset);
         ctx_->IASetIndexBuffer(it->second.mesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
-        ctx_->DrawIndexed(it->second.mesh.indexCount, 0, 0);
+        ctx_->DrawIndexedInstanced(it->second.mesh.indexCount, 1, 0, 0, (UINT)chunkOpaque_.size() * 2);  // (zero translation)
         n++;
     }
     stats.bodiesDrawn = n;
@@ -894,7 +1053,7 @@ void Renderer::drawParticles() {
     ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx_->IASetVertexBuffers(0, 1, partVB_.GetAddressOf(), &stride, &offset);
     ctx_->IASetIndexBuffer(partIB_.Get(), DXGI_FORMAT_R32_UINT, 0);
-    ctx_->DrawIndexed(partIndexCount_, 0, 0);
+    ctx_->DrawIndexedInstanced(partIndexCount_, 1, 0, 0, (UINT)chunkOpaque_.size() * 2);  // (zero translation)
 }
 
 // Wireframe sphere: the Creator's brush indicator (material coloured) or the Gun's carve preview (red).
@@ -1026,6 +1185,14 @@ void Renderer::buildHudText(const Game& g, std::vector<std::string>& hud, std::v
     }
     snprintf(b, sizeof(b), "BRUSH     radius %d   (mouse wheel)", g.brush);
     hud.push_back(b);
+    if (g.infinite) {
+        const long long gx = g.playerGlobalX(), gz = g.playerGlobalZ();
+        const long long R = World::REGION;
+        auto fdiv = [&](long long a) { return a / R - ((a % R != 0 && a < 0) ? 1 : 0); };
+        snprintf(b, sizeof(b), "POSITION  x %lld  y %.0f  z %lld   region (%lld, %lld)   saved regions %zu (%.1f KB)", gx, g.player.pos.y, gz, fdiv(gx), fdiv(gz),
+                 g.world.savedRegions.size(), (double)g.world.savedBytes() / 1024.0);
+        hud.push_back(b);
+    }
     size_t awake = g.physics.awakeCount();
     snprintf(b, sizeof(b), "BODIES    %zu (%zu awake)   SAND %lld  WATER %lld  DIRT %lld  GRASS %lld", g.physics.bodies.size(), awake, g.world.counts[M_SAND],
              g.world.counts[M_WATER], g.world.counts[M_DIRT], g.world.counts[M_GRASS]);
@@ -1306,11 +1473,15 @@ void Renderer::render(Game& g, float dt) {
     // --- sun + shadow frustum fitted to the arena ---------------------------------------------------
     const Vec3 L(std::cos(sunElevation) * std::sin(sunAzimuth), std::sin(sunElevation), std::cos(sunElevation) * std::cos(sunAzimuth));
     {
-        const Vec3 c(cfg::ARENA_OX + cfg::ARENA_TOTAL * 0.5f, 80.0f, cfg::ARENA_OZ + cfg::ARENA_TOTAL * 0.5f);
+        // Arena: fitted to the walled arena. Infinite world: the whole window (that is as much as is loaded).
+        const bool win = g.infinite;
+        const float ox = win ? 16.0f : (float)cfg::ARENA_OX, oz = win ? 16.0f : (float)cfg::ARENA_OZ;
+        const float ext = win ? (float)(cfg::WORLD_X - 32) : (float)cfg::ARENA_TOTAL;
+        const Vec3 c(ox + ext * 0.5f, 80.0f, oz + ext * 0.5f);
         const Vec3 up = std::fabs(L.y) > 0.95f ? Vec3(0, 0, 1) : Vec3(0, 1, 0);
         const Mat4 lv = Mat4::lookAt(c + L * 600.0f, c, up);
-        const Vec3 bmin(cfg::ARENA_OX - 4.0f, -2.0f, cfg::ARENA_OZ - 4.0f);
-        const Vec3 bmax(cfg::ARENA_OX + cfg::ARENA_TOTAL + 4.0f, cfg::WALL_HEIGHT + 70.0f, cfg::ARENA_OZ + cfg::ARENA_TOTAL + 4.0f);
+        const Vec3 bmin(ox - 4.0f, -2.0f, oz - 4.0f);
+        const Vec3 bmax(ox + ext + 4.0f, cfg::WALL_HEIGHT + 70.0f, oz + ext + 4.0f);
         Vec3 lo(1e9f, 1e9f, 1e9f), hi(-1e9f, -1e9f, -1e9f);
         for (int i = 0; i < 8; i++) {
             const Vec3 p((i & 1) ? bmax.x : bmin.x, (i & 2) ? bmax.y : bmin.y, (i & 4) ? bmax.z : bmin.z);
@@ -1333,6 +1504,9 @@ void Renderer::render(Game& g, float dt) {
     set4(fc.sunColor, 1.0f, 0.92f, 0.78f, 1);
     set4(fc.skyZenith, 0.30f, 0.41f, 0.64f, 1);
     set4(fc.skyHorizon, 0.56f, 0.64f, 0.80f, 1);
+    // The sky you see: in the endless world a deeper blue with drifting clouds (the light it casts is unchanged).
+    if (g.infinite) set4(fc.skyView, 0.13f, 0.28f, 0.66f, 0.85f);
+    else set4(fc.skyView, 0.30f, 0.41f, 0.64f, 0.0f);
     set4(fc.groundCol, 0.22f, 0.19f, 0.16f, 1);
     const Tier& tr = kTiers[std::clamp(tier_, 0, 4)];
     set4(fc.params, 1.0f / (float)shadowSize_, (float)(skyRays > 0 ? std::min(skyRays, tr.rays) : 0), tr.rayLen, (float)tr.raySteps);
@@ -1341,6 +1515,34 @@ void Renderer::render(Game& g, float dt) {
     set4(fc.camRight, camRight_.x, camRight_.y, camRight_.z, aspect);
     set4(fc.camUp, camUp_.x, camUp_.y, camUp_.z, std::tan(fovY_ * 0.5f));
     set4(fc.camFwd, camFwd_.x, camFwd_.y, camFwd_.z, 0);
+    // Chunk-loading fog: clear over the region the player stands in, thickening across the eight neighbours until the edge of the
+    // loaded world is hidden. (Off in the classic arena.)
+    {
+        // The loaded window is 480 wide and the player stays within ~22 voxels of its middle, so the edge is never nearer than ~218.
+        const long long hx = ((g.world.originX % 65536) + 65536) % 65536, hz = ((g.world.originZ % 65536) + 65536) % 65536;
+        set4(fc.fogA, g.infinite ? 1.0f : 0.0f, 70.0f, 208.0f, 0);
+        set4(fc.fogB, 0, (float)hx, (float)hz, g.infinite ? 1.0f : 0.0f);
+    }
+    // per-instance chunk translations (changes only when the window shifts or a chunk is rebuilt)
+    if (chunkOffDirty_) {
+        chunkOffDirty_ = false;
+        const size_t nn = chunkOpaque_.size();
+        for (size_t i = 0; i < nn; i++) {
+            chunkOff_[i * 2] = chunkOpaque_[i].sx;
+            chunkOff_[i * 2 + 1] = chunkOpaque_[i].sz;
+            chunkOff_[(nn + i) * 2] = chunkWater_[i].sx;
+            chunkOff_[(nn + i) * 2 + 1] = chunkWater_[i].sz;
+        }
+        D3D11_MAPPED_SUBRESOURCE mo;
+        if (SUCCEEDED(ctx_->Map(chunkOffVB_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mo))) {
+            memcpy(mo.pData, chunkOff_.data(), chunkOff_.size() * sizeof(float));
+            ctx_->Unmap(chunkOffVB_.Get(), 0);
+        }
+    }
+    {
+        const UINT offStride = 2 * sizeof(float), offOffset = 0;
+        ctx_->IASetVertexBuffers(1, 1, chunkOffVB_.GetAddressOf(), &offStride, &offOffset);
+    }
     D3D11_MAPPED_SUBRESOURCE mp;
     if (SUCCEEDED(ctx_->Map(cbFrame_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
         memcpy(mp.pData, &fc, sizeof(fc));
@@ -1373,7 +1575,7 @@ void Renderer::render(Game& g, float dt) {
         ctx_->VSSetShader(vsShadow_.Get(), nullptr, 0);
         ctx_->PSSetShader(nullptr, nullptr, 0);
         setObject(Mat4::identity(), 1, 1, 1, 1);
-        drawChunks(false, nullptr);
+        drawChunks(false, nullptr, 0.0f);
         drawBodies(g);
         drawParticles();
     }
@@ -1398,7 +1600,7 @@ void Renderer::render(Game& g, float dt) {
     const Frustum fr = extractFrustum(viewProj_);
     auto drawOpaque = [&]() {
         setObject(Mat4::identity(), 1, 1, 1, 1, 1.0f);  // chunk meshes: ambient occlusion comes from the volume
-        drawChunks(false, &fr);
+        drawChunks(false, &fr, 1.0f);
         drawBodies(g);
         drawParticles();
     };
@@ -1417,7 +1619,7 @@ void Renderer::render(Game& g, float dt) {
     ctx_->OMSetBlendState(bsWater_.Get(), nullptr, 0xFFFFFFFF);
     ctx_->OMSetDepthStencilState(dsLessNoWrite_.Get(), 0);
     setObject(Mat4::identity(), 1, 1, 1, 1);
-    drawChunks(true, &fr);
+    drawChunks(true, &fr, 0.0f);
     ctx_->OMSetBlendState(bsOpaque_.Get(), nullptr, 0xFFFFFFFF);
 
     // Camera under water: tint the whole view (the water surface itself is not drawn from below).

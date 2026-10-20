@@ -5,13 +5,13 @@
 namespace prof {
 
 enum Slot {
-    P_PLAYER, P_TOOLS, P_PHYS, P_OVERLAY, P_SIM, P_PARTICLES,   // Game::update
+    P_STREAM, P_PLAYER, P_TOOLS, P_PHYS, P_OVERLAY, P_SIM, P_PARTICLES,   // Game::update
     P_MESH, P_UPLOAD, P_BODIES, P_DRAW, P_PRESENT,             // Renderer::render (CPU side)
     P_COUNT
 };
 enum GpuSlot { G_SHADOW, G_MAIN, G_WATER, G_POST, G_TOTAL, G_COUNT };
 
-inline const char* kNames[P_COUNT] = {"player", "tools(paint/fire)", "rigid bodies", "body overlay", "cell sim", "particles",
+inline const char* kNames[P_COUNT] = {"chunk loading", "player", "tools(paint/fire)", "rigid bodies", "body overlay", "cell sim", "particles",
                                       "chunk meshing", "gpu uploads", "body meshes", "draw submit", "present"};
 inline const char* kGpuNames[G_COUNT] = {"shadow map", "sky/opaque", "water+brush+gun", "resolve+hud", "GPU total"};
 

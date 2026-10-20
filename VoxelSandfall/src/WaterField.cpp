@@ -267,6 +267,52 @@ void WaterField::step(float dt) {
     }
 }
 
+namespace {
+// new[x][z] = old[x + dx][z + dz], in place, one row at a time (everything outside the old array becomes 0). Rows are visited
+// in the order that never overwrites a row that is still to be read.
+template <class T>
+void shiftArray(std::vector<T>& a, int perCell, int w, int d, int dx, int dz) {
+    const size_t rowElems = (size_t)w * (size_t)perCell;
+    const int x0 = std::max(0, -dx), x1 = std::min(w, w - dx);  // destination columns that have a source
+    T* base = a.data();
+    auto doRow = [&](int z) {
+        T* dst = base + (size_t)z * rowElems;
+        const int sz = z + dz;
+        if (sz < 0 || sz >= d || x1 <= x0) {
+            std::memset(dst, 0, rowElems * sizeof(T));
+            return;
+        }
+        std::memmove(dst + (size_t)x0 * perCell, base + (size_t)sz * rowElems + (size_t)(x0 + dx) * perCell, sizeof(T) * (size_t)perCell * (size_t)(x1 - x0));
+        if (x0 > 0) std::memset(dst, 0, sizeof(T) * (size_t)perCell * (size_t)x0);
+        if (x1 < w) std::memset(dst + (size_t)x1 * perCell, 0, sizeof(T) * (size_t)perCell * (size_t)(w - x1));
+    };
+    if (dz >= 0)
+        for (int z = 0; z < d; z++) doRow(z);
+    else
+        for (int z = d - 1; z >= 0; z--) doRow(z);
+}
+}  // namespace
+
+void WaterField::shift(int dx, int dz) {
+    if (dx == 0 && dz == 0) return;
+    if (wet_ == 0 && !active_) return;  // no water and no ripples anywhere: the field is all zeros, nothing to move or upload
+    shiftArray(mask_, 1, W, D, dx, dz);
+    shiftArray(h_, 1, W, D, dx, dz);
+    shiftArray(v_, 1, W, D, dx, dz);
+    shiftArray(foam_, 1, W, D, dx, dz);
+    shiftArray(smooth_, 1, W, D, dx, dz);
+    shiftArray(baseSx_, 1, W, D, dx, dz);
+    shiftArray(baseSz_, 1, W, D, dx, dz);
+    shiftArray(shore_, 1, W, D, dx, dz);
+    shiftArray(tex_, 4, W, D, dx, dz);
+    wet_ = 0;
+    for (uint8_t m : mask_) wet_ += m;
+    std::fill(tileAct_.begin(), tileAct_.end(), (uint8_t)(active_ ? 1 : 0));  // quiet tiles go back to sleep on their own
+    hole0X_ = hole0Z_ = 0;
+    hole1X_ = hole1Z_ = -1;
+    markDirty(0, 0, W - 1, D - 1);
+}
+
 float WaterField::peakRipple() const {
     float m = 0;
     for (size_t i = 0; i < h_.size(); i++) m = std::max(m, std::fabs(h_[i]));

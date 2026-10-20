@@ -55,6 +55,14 @@ void Player::respawn() {
     onGround = false;
 }
 
+void Player::respawnAt(const Vec3& feet) {
+    pos = Vec3(feet.x, feet.y + kSkin, feet.z);
+    vel = Vec3(0, 0, 0);
+    yaw = 0;
+    pitch = 0;
+    onGround = false;
+}
+
 // Sweep the AABB along one axis, stopping flush against the first solid voxel slab. Returns the
 // displacement actually applied.
 float Player::sweepAxis(const World& w, int a, float d) {

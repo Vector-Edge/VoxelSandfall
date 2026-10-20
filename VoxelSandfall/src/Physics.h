@@ -80,6 +80,7 @@ public:
     void step(float dt);
     void wakeNear(const Vec3& c, float r);
     void wakeAll();
+    void clearOverlays();     // every body's overlay marks are removed (before the world's storage is remapped)
     void rasterizeOverlay();  // keeps World::overlay in sync with the bodies (sand/water/player see them)
     void purgeDead();
     size_t awakeCount() const;

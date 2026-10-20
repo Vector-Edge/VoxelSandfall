@@ -8,14 +8,15 @@ constexpr int ARENA_SIZE = 256;   // bedrock floor is ARENA_SIZE x ARENA_SIZE x 
 constexpr int WALL_THICK = 3;     // perimeter walls of Normal Stone, 3 voxels thick
 constexpr int WALL_HEIGHT = 160;  // wall height above the floor layer (voxels)
 
-// World grid (multiples of the 32-voxel chunk size).
-constexpr int WORLD_X = 288;
+// World grid (multiples of the 32-voxel chunk size). In the endless world this is the loaded window around the player
+// (15 x 15 chunk columns); the classic arena sits in its corner.
+constexpr int WORLD_X = 480;
 constexpr int WORLD_Y = 256;
-constexpr int WORLD_Z = 288;
+constexpr int WORLD_Z = 480;
 
 constexpr int ARENA_TOTAL = ARENA_SIZE + 2 * WALL_THICK;  // floor + walls on each side
-constexpr int ARENA_OX = (WORLD_X - ARENA_TOTAL) / 2;      // wall outer corner
-constexpr int ARENA_OZ = (WORLD_Z - ARENA_TOTAL) / 2;
+constexpr int ARENA_OX = 13;                               // wall outer corner
+constexpr int ARENA_OZ = 13;
 constexpr int FLOOR_X0 = ARENA_OX + WALL_THICK;            // floor extent [X0, X1)
 constexpr int FLOOR_X1 = FLOOR_X0 + ARENA_SIZE;
 constexpr int FLOOR_Z0 = ARENA_OZ + WALL_THICK;

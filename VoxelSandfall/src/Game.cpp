@@ -8,10 +8,14 @@ Game::Game() {
 
 void Game::reset() {
     physics.bodies.clear();
+    stash_.clear();
+    pendingShifts.clear();
     physics.nextId = 1;
-    world.generateArena();
+    if (infinite) world.initStreaming();
+    else world.generateArena();
     world.clearPlayerBox();
-    player.respawn();
+    if (infinite) player.respawnAt(Vec3(cfg::WORLD_X * 0.5f, 1.0f, cfg::WORLD_Z * 0.5f));
+    else player.respawn();
     particles.clear();
     hollow_.clear();
     world.splashes.clear();
@@ -22,6 +26,11 @@ void Game::reset() {
 void Game::update(float dt, const GameInput& in) {
     dt = std::min(dt, 0.1f);
     time += dt;
+
+    {
+        prof::Scope sc(prof::P_STREAM);
+        updateStreaming();
+    }
 
     // --- look / tool selection -------------------------------------------------------------
     player.yaw -= in.lookDX * mouseSens;

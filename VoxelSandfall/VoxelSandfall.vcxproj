@@ -102,6 +102,8 @@
     <ClCompile Include="src\Renderer.cpp" />
     <ClCompile Include="src\SandFx.cpp" />
     <ClCompile Include="src\Dirt.cpp" />
+    <ClCompile Include="src\Stream.cpp" />
+    <ClCompile Include="src\GameStream.cpp" />
     <ClCompile Include="src\WaterField.cpp" />
     <ClCompile Include="src\SelfTest.cpp" />
     <ClCompile Include="src\Tools.cpp" />

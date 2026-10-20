@@ -23,6 +23,8 @@
     <ClCompile Include="src\Game.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\SandFx.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\Dirt.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\Stream.cpp"><Filter>Game</Filter></ClCompile>
+    <ClCompile Include="src\GameStream.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\WaterField.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\SelfTest.cpp"><Filter>Game</Filter></ClCompile>
     <ClCompile Include="src\main.cpp"><Filter>Game</Filter></ClCompile>

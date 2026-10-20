@@ -1,5 +1,6 @@
 // Game state + per-frame update (player, tools, rigid bodies, cellular simulation, debris).
 #pragma once
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,19 @@ public:
 
     void reset();
     void update(float dt, const GameInput& in);
+
+    // ---- chunk loading (GameStream.cpp) ---------------------------------------------------------
+    // infinite = true: the world is endless (a window of 3 x 3 regions around the player, recentred as the player walks);
+    // false: the classic walled arena. Changing it resets the world.
+    bool infinite = false;
+    void setInfinite(bool on);
+    std::vector<std::pair<int, int>> pendingShifts;  // window recentrings (in regions) the renderer has not applied yet
+    int regionsShifted = 0;                         // how many recentrings so far (diagnostics)
+    // Global voxel position of the player (the window origin plus the local position).
+    long long playerGlobalX() const { return world.originX + (long long)std::floor(player.pos.x); }
+    long long playerGlobalZ() const { return world.originZ + (long long)std::floor(player.pos.z); }
+    size_t stashedBodies() const { return stash_.size(); }
+
     uint8_t currentMaterial() const { return kPaintMaterials[materialIndex]; }
 
     // Tool actions (also used by the scripted test driver).
@@ -93,6 +107,15 @@ public:
     int lostGrains = 0;         // displaced voxels that could not be put back anywhere (diagnostics)
 
 private:
+    struct StashedBody {
+        long long rx = 0, rz = 0;  // global region the body is in
+        std::unique_ptr<Body> body;  // pos is relative to the region's corner
+    };
+    std::vector<StashedBody> stash_;
+    void updateStreaming();
+    void shiftWorld(int dRx, int dRz);
+    void stashBody(std::unique_ptr<Body> b);
+    void restoreStashedBodies();
     void updateTools(float dt, const GameInput& in);
     void updateSandInteraction(float dt, const GameInput& in, float velYBefore, bool wasOnGround);
     void updateWaterInteraction(float dt, const Vec3& velBefore);

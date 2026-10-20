@@ -5,6 +5,7 @@ struct VSIn
 {
     float3 pos : POSITION;
     uint attr : ATTR;
+    float2 off : CHUNKOFF;  // per instance: how far the chunk mesh has been moved by window shifts (x, z); 0 for everything else
 };
 
 struct VSOut
@@ -22,7 +23,9 @@ float4 VSShadow(VSIn i) : SV_Position
 {
     // Water droplets do not cast shadows (they would show up as black spots on the bed of a pool): park them outside the clip volume.
     if (((i.attr >> 3) & 7) == 2) return float4(4, 4, 4, 1);
-    return mul(lightViewProj, mul(model, float4(i.pos, 1)));
+    float4 p = mul(model, float4(i.pos, 1));
+    p.xz += i.off;
+    return mul(lightViewProj, p);
 }
 
 VSOut VSWorld(VSIn i)
@@ -32,6 +35,7 @@ VSOut VSWorld(VSIn i)
     uint m = (i.attr >> 3) & 7;
     uint ao = (i.attr >> 6) & 3;
     float4 wp = mul(model, float4(i.pos, 1));
+    wp.xz += i.off;
     o.sv = mul(viewProj, wp);
     o.wpos = wp.xyz;
     o.vpos = i.pos;
@@ -46,7 +50,8 @@ float4 PSWorld(VSOut i) : SV_Target
 {
     float3 n = normalize(i.nrm);
     float3 on = kNormals[i.nidx];
-    float3 cell = floor(i.vpos - on * 0.5);
+    // Voxel colour noise is keyed by the voxel's global position (the world window moves, the pattern must not).
+    float3 cell = floor((objParams.x > 0.5 ? i.wpos + float3(fogB.y, 0, fogB.z) : i.vpos) - on * 0.5);
     float h1 = hash13(cell + float3(7.1, 3.3, 1.7) * i.mat);
     float h2 = hash13(cell.zxy + 19.19);
     float3 albedo = materialColor(i.mat, h1, h2, length(camPos.xyz - i.wpos)) * tint.rgb;
@@ -67,7 +72,9 @@ float4 PSWorld(VSOut i) : SV_Target
     float3 ambient = hemi * skyVis * aoTerm;
     float3 lit = albedo * (sunColor.rgb * sunDir.w * sun + ambient);
     if (i.mat == 2) lit += float3(0.05, 0.12, 0.2);  // splash droplets glow a little so they read as water
-    return float4(toDisplay(lit) + ditherNoise(i.sv.xy) / 255.0, 1);
+    float3 col = toDisplay(lit);
+    col = lerp(col, fogColorDisplay(i.wpos), fogAmount(i.wpos));
+    return float4(col + ditherNoise(i.sv.xy) / 255.0, 1);
 }
 
 // ---- water ----------------------------------------------------------------------------------------------
@@ -75,15 +82,6 @@ float4 PSWorld(VSOut i) : SV_Target
 // colour is a Fresnel mix of the mirrored world (sky or the voxels around) and the water body, whose colour depends
 // on how deep the water is (red light is absorbed first, so shallows are clear and the deep goes teal). Foam sits
 // on splashes and along the shore. The pixel shader emits `add` and `mul`: result = add + background * mul.
-float vnoise(float2 p)
-{
-    float2 i = floor(p), f = frac(p);
-    float2 u = f * f * (3.0 - 2.0 * f);
-    float a = hash13(float3(i, 1.0)), b = hash13(float3(i + float2(1, 0), 1.0));
-    float c = hash13(float3(i + float2(0, 1), 1.0)), d = hash13(float3(i + float2(1, 1), 1.0));
-    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
-}
-
 // Slope of a calm water surface: travelling waves of different lengths whose phase is bent by slow noise, so the
 // pattern never reads as a regular grid. Waves that would be smaller than a few pixels fade out (no shimmer).
 float2 waveSlope(float2 p, float t, float footprint, int detail)
@@ -101,6 +99,7 @@ float2 waveSlope(float2 p, float t, float footprint, int detail)
         {
             float bend = detail >= 2 ? vnoise(p * 0.045 + i * 7.3) * 4.0 : (float)i * 1.7;
             float phase = dot(w.xy, p) * w.z + t * 0.45 * sqrt(700.0 * w.z) + bend;
+            phase = 6.2831853 * frac(phase * 0.15915494);  // (p is a global coordinate, up to ~65000: keep cos() in its accurate range)
             s += w.xy * (cos(phase) * w.w * fade);
         }
     }
@@ -158,7 +157,7 @@ struct WaterOut
 WaterOut PSWater(VSOut i)
 {
     const float3 on = kNormals[i.nidx];
-    const int3 cell = int3(floor(i.vpos - on * 0.5));  // the water voxel that owns this face
+    const int3 cell = int3(floor(i.wpos - on * 0.5));  // the water voxel that owns this face
     const float3 toEye = camPos.xyz - i.wpos;
     const float dist = length(toEye);
     const float3 v = toEye / dist;
@@ -197,12 +196,15 @@ WaterOut PSWater(VSOut i)
     }
 
     const float4 fld = waterField.SampleLevel(linSamp, i.wpos.xz / gridDims.xz, 0);
+    // Waves, caustics and foam are patterns of the world, not of the loaded window: they are keyed by the global position
+    // (fogB.yz = the window's origin), so they stay put when the window slides.
+    const float2 gp = i.wpos.xz + fogB.yz;
     const float footprint = dist * camUp.w * 0.00185;  // voxels per pixel at this distance
     const float calm = saturate((depth - 0.5) * 0.4);   // thin films do not ripple
     // A film a voxel or two deep (the water where it runs out over a bank or a stone terrace) is not a mirror: it only wets
     // what is under it. Its reflection, ripples and glints fade out with the depth.
     const float thin = smoothstep(0.5, 3.5, (float)depth);
-    const float2 slope = (fld.xy * 1.8 + waveSlope(i.wpos.xz, camPos.w, footprint, detail) * calm) * (0.25 + 0.75 * thin);
+    const float2 slope = (fld.xy * 1.8 + waveSlope(gp, camPos.w, footprint, detail) * calm) * (0.25 + 0.75 * thin);
     const float3 n = surface ? normalize(float3(-slope.x, 1.0, -slope.y)) : on;
 
     // Fresnel (Schlick, water F0 = 0.02): grazing views are mirrors, looking straight down you see through.
@@ -257,15 +259,15 @@ WaterOut PSWater(VSOut i)
     [branch] if (detail >= 1 && surface && sunTop > 0.01 && causticK > 0.02)  // the Worley pattern is the priciest part: only where it shows
     {
         const float3 rd = refract(-v, n, 1.0 / 1.33);
-        const float2 bed = i.wpos.xz + rd.xz / max(-rd.y, 0.2) * depth;
+        const float2 bed = gp + rd.xz / max(-rd.y, 0.2) * depth;
         mul *= 1.0 + causticK * sunTop * 0.95 * (caustics(bed, camPos.w, detail >= 2 ? 2 : 1) - 0.3);
     }
 
     // Foam: lacy white on fresh splashes and in a thin line where the water meets land.
     [branch] if (surface && (fld.z > 0.02 || fld.w > 0.12))
     {
-        const float lace = detail >= 2 ? 0.5 * vnoise(i.wpos.xz * 0.9 + camPos.w * 0.08) + 0.5 * vnoise(i.wpos.xz * 2.3 - camPos.w * 0.05)
-                         : (detail == 1 ? vnoise(i.wpos.xz * 1.2 + camPos.w * 0.06) : 0.5);
+        const float lace = detail >= 2 ? 0.5 * vnoise(gp * 0.9 + camPos.w * 0.08) + 0.5 * vnoise(gp * 2.3 - camPos.w * 0.05)
+                         : (detail == 1 ? vnoise(gp * 1.2 + camPos.w * 0.06) : 0.5);
         const float shoreBand = smoothstep(0.14, 0.40, fld.w) * smoothstep(0.30, 0.65, lace);
         const float splash = smoothstep(0.30, 1.05, fld.z * (0.25 + 1.3 * lace)) * 0.92;
         const float foamAmt = saturate(max(shoreBand * 0.35 * (0.4 + 0.6 * thin), splash));
@@ -273,6 +275,11 @@ WaterOut PSWater(VSOut i)
         add = lerp(add, foamCol, foamAmt);
         mul *= 1.0 - foamAmt;
     }
+
+    // chunk fog: the water fades into the fog like everything else (what is seen through it is already fogged)
+    const float fog = fogAmount(i.wpos);
+    add = lerp(add, fogColorDisplay(i.wpos), fog);
+    mul *= 1.0 - fog;
 
     WaterOut o;
     o.add = float4(add + ditherNoise(i.sv.xy) / 255.0, 1.0);

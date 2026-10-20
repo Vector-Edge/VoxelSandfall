@@ -282,6 +282,17 @@ bool runScript(const std::string& path) {
                 r.camOverrideYaw = deg2rad(yw);
                 r.camOverridePitch = deg2rad(pt);
             }
+        } else if (cmd == "infinite") {  // infinite on|off   (resets the world)
+            std::string v;
+            ss >> v;
+            game.setInfinite(v != "off");
+        } else if (cmd == "tp") {  // tp globalX globalZ   (infinite world: walk there instantly; the window recentres on the next update)
+            long long gx = 0, gz = 0;
+            ss >> gx >> gz;
+            game.player.pos.x = (float)(gx - game.world.originX);
+            game.player.pos.z = (float)(gz - game.world.originZ);
+            game.player.vel = Vec3(0, 0, 0);
+            game.update(1.0f / 120.0f, GameInput());
         } else if (cmd == "look") {  // look yawDeg pitchDeg
             float yaw = 0, pitch = 0;
             ss >> yaw >> pitch;
@@ -425,6 +436,10 @@ bool runScript(const std::string& path) {
             r.render(game, 1.0f / 60.0f);
             r.requestScreenshot(name);
             r.render(game, 0.0f);
+        } else if (cmd == "settime") {  // settime seconds   (pins the animation clock, so two screenshots can be compared)
+            float t = 0;
+            ss >> t;
+            game.time = t;
         } else if (cmd == "sun") {
             float az = 0.62f, el = 0.95f;
             ss >> az >> el;
@@ -511,7 +526,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     int width = 1600, height = 900;
     std::string scriptPath;
-    int rays = -1, msaa = 4, qualityArg = -1;
+    int rays = -1, msaa = 4, qualityArg = -1, worldMode = -1;  // worldMode: 0 = classic arena, 1 = infinite, -1 = default
     bool qualityGiven = false;
     bool noVsync = false;
     float autoQuit = 0;
@@ -530,6 +545,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             msaa = atoi(args[++i].c_str());
         } else if (a == "--autoquit" && i + 1 < args.size()) {
             autoQuit = (float)atof(args[++i].c_str());
+        } else if (a == "--arena") {
+            worldMode = 0;
+        } else if (a == "--infinite") {
+            worldMode = 1;
         } else if (a == "--novsync") {
             noVsync = true;
         } else if (a == "--quality" && i + 1 < args.size()) {
@@ -562,6 +581,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     static Game game;
     g_game = &game;
+    // Playing: the endless world. Scripts / tests keep the classic walled arena unless --infinite is given.
+    game.setInfinite(worldMode >= 0 ? worldMode == 1 : !g_scriptMode);
 
     if (g_scriptMode) {
         runScript(scriptPath);

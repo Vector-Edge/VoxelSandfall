@@ -200,6 +200,15 @@ void Physics::clearOverlay(Body& b) {
     b.ovCells.clear();
 }
 
+void Physics::clearOverlays() {
+    for (auto& up : bodies) {
+        clearOverlay(*up);
+        up->ovDirty = true;
+        up->ovValid = false;
+    }
+    world.overlayActive = false;
+}
+
 void Physics::purgeDead() {
     bool any = false;
     for (auto& up : bodies)

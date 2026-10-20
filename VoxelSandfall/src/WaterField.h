@@ -43,6 +43,9 @@ public:
     // Advances the ripples (fixed internal step) and fades the foam.
     void step(float dt);
 
+    // The world window moved: new[x][z] = old[x + dx][z + dz] (columns; both multiples of the 16 column tile size).
+    void shift(int dx, int dz);
+
     // W * D * 4 half floats. consumeDirty() returns the (inclusive) rectangle of columns that changed since last asked.
     const uint16_t* texels() const { return tex_.data(); }
     bool consumeDirty(int& x0, int& z0, int& x1, int& z1) {

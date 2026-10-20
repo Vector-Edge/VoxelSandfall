@@ -3,6 +3,9 @@
 #include "Parallel.h"
 
 World::World() {
+    resetColumns();
+    chunkModified.assign(chunkCount(), 0);
+    chunkUrgent.assign(chunkCount(), 0);
     size_t total = (size_t)chunkCount() << 15;
     data.assign(total, 0);
     overlay.assign(total, 0);
@@ -36,6 +39,7 @@ void World::markDirtyImpl(int x, int y, int z, std::vector<uint8_t>& meshFlags) 
     const int own = chunkIndex(cx, cy, cz);
     if (&meshFlags == &meshDirty && !summaryDirty[own]) summaryDirty[own] = 1;  // solids may have changed (not for water <-> air)
     if (!texDirty[own]) texDirty[own] = 1;
+    chunkModified[own] = 1;
     if ((unsigned)(lx - 1) < 30u && (unsigned)(ly - 1) < 30u && (unsigned)(lz - 1) < 30u) {  // interior: own chunk only
         if (!meshFlags[own]) meshFlags[own] = 1;
         return;
@@ -142,6 +146,7 @@ void World::notifyBox(int x0, int y0, int z0, int x1, int y1, int z1, bool water
                 (waterOnly ? waterDirty : meshDirty)[ci] = 1;
                 if (!waterOnly) summaryDirty[ci] = 1;
                 texDirty[ci] = 1;
+                chunkModified[ci] = 1;
             }
     // Wake every cellular voxel in (and one cell around) the box. Rows are contiguous in x inside a chunk,
     // so this is a cheap linear scan.
@@ -162,6 +167,7 @@ void World::notifyBoxWater(int x0, int y0, int z0, int x1, int y1, int z1) {
                 const int ci = chunkIndex(cx, cy, cz);
                 waterDirty[ci] = 1;
                 texDirty[ci] = 1;
+                chunkModified[ci] = 1;
             }
     // the shell just outside the box
     for (int z = az0; z <= az1; z++)
@@ -189,6 +195,11 @@ void World::setWaterQuiet(int x, int y, int z) {
 }
 
 void World::generateArena() {
+    epoch++;
+    streaming = false;
+    originX = originZ = 0;
+    savedRegions.clear();
+    resetColumns();
     std::fill(data.begin(), data.end(), (uint8_t)0);
     std::fill(overlay.begin(), overlay.end(), (uint8_t)0);
     overlayActive = false;
@@ -217,6 +228,8 @@ void World::generateArena() {
     for (auto& c : counts) c = 0;
     for (size_t i = 0; i < data.size(); i++) counts[data[i] & VOX_MASK]++;
     markAllDirty();
+    std::fill(chunkModified.begin(), chunkModified.end(), (uint8_t)0);
+    std::fill(chunkUrgent.begin(), chunkUrgent.end(), (uint8_t)0);
 }
 
 RayHit World::raycast(const Vec3& o, const Vec3& d, float maxDist, uint32_t mask) const {

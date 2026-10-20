@@ -1,5 +1,7 @@
 // Voxel world: chunk-contiguous byte grid, cellular-automaton state, ray casting.
 #pragma once
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Config.h"
@@ -50,6 +52,14 @@ public:
     static constexpr int CVOL = CS * CS * CS;
     static_assert(cfg::WORLD_X % CS == 0 && cfg::WORLD_Y % CS == 0 && cfg::WORLD_Z % CS == 0, "world dims");
 
+    // Chunk loading (Stream.cpp): the grid is a window of WIN_REGIONS x WIN_REGIONS regions of REGION x REGION columns.
+    // A region is one chunk column; the window slides one column at a time, keeping the player within a column of its centre.
+    static constexpr int REGION = 32;                       // streaming unit = 1 x 1 chunk columns
+    static constexpr int REGION_CHUNKS = REGION / CS;
+    static constexpr int WIN_REGIONS = cfg::WORLD_X / REGION;
+    static constexpr int NCOL = (cfg::WORLD_X / CS) * (cfg::WORLD_Z / CS);  // chunk columns in the window
+    static_assert(cfg::WORLD_X == REGION * WIN_REGIONS && cfg::WORLD_Z == REGION * WIN_REGIONS, "the window is whole regions");
+
     const int SX = cfg::WORLD_X, SY = cfg::WORLD_Y, SZ = cfg::WORLD_Z;
     const int CX = SX / CS, CY = SY / CS, CZ = SZ / CS;
 
@@ -61,17 +71,24 @@ public:
     inline bool inBounds(int x, int y, int z) const {
         return (unsigned)x < (unsigned)SX && (unsigned)y < (unsigned)SY && (unsigned)z < (unsigned)SZ;
     }
+    // Storage is organised in physical blocks of one chunk column (CY chunks); colSlot_ maps the logical chunk column of the
+    // window to its block, so the window can scroll without copying anything.
     inline size_t idx(int x, int y, int z) const {
-        size_t ci = (size_t)((x >> 5) + CX * ((y >> 5) + CY * (z >> 5)));
+        const size_t ci = (size_t)(colSlot_[(x >> 5) + CX * (z >> 5)] * CY + (y >> 5));
         return (ci << 15) + ((size_t)(z & 31) << 10) + ((size_t)(y & 31) << 5) + (size_t)(x & 31);
     }
-    const uint8_t* chunkData(int ci) const { return data.data() + ((size_t)ci << 15); }
+    // Voxels of the chunk with the logical index ci (chunkIndex(cx, cy, cz)).
+    const uint8_t* chunkData(int ci) const {
+        const int cx = ci % CX, cy = (ci / CX) % CY, cz = ci / (CX * CY);
+        return data.data() + (((size_t)colSlot_[cx + CX * cz] * CY + (size_t)cy) << 15);
+    }
     // Inverse of idx(): the cell a raw index belongs to.
     inline void cellOfIndex(size_t i, int& x, int& y, int& z) const {
-        const int ci = (int)(i >> 15), l = (int)(i & 32767);
-        x = (ci % CX) * CS + (l & 31);
-        y = ((ci / CX) % CY) * CS + ((l >> 5) & 31);
-        z = (ci / (CX * CY)) * CS + (l >> 10);
+        const int pc = (int)(i >> 15), l = (int)(i & 32767);
+        const int lc = colLogical_[pc / CY];
+        x = (lc % CX) * CS + (l & 31);
+        y = (pc % CY) * CS + ((l >> 5) & 31);
+        z = (lc / CX) * CS + (l >> 10);
     }
 
     // ---- voxel access --------------------------------------------------------------------------
@@ -136,7 +153,28 @@ public:
     size_t activeCount() const;
 
     // ---- template / generation -----------------------------------------------------------------
-    void generateArena();
+    void generateArena();  // the classic walled 256 x 256 arena (fixed world, no chunk loading)
+
+    // ---- chunk loading (Stream.cpp) --------------------------------------------------------------
+    uint32_t epoch = 0;                     // bumped whenever the whole world is replaced (reset / mode change)
+    bool streaming = false;                 // true: the grid is a scrolling window of an infinite world
+    long long originX = 0, originZ = 0;     // global voxel coordinate of local (0, 0); multiples of REGION
+    static constexpr int CENTER = WIN_REGIONS / 2;  // index of the window's middle region (where the player stands)
+    std::unordered_map<uint64_t, std::vector<uint8_t>> savedRegions;  // modified regions that left the window (compressed)
+    std::vector<uint8_t> chunkModified;     // per logical chunk: changed since it was loaded (saved when it leaves)
+    std::vector<uint8_t> chunkUrgent;       // per logical chunk: freshly loaded - the renderer meshes it before drawing
+    struct ShiftResult {
+        std::vector<std::pair<long long, long long>> loaded, evicted;  // global region coordinates
+        std::vector<std::pair<long long, long long>> restored;         // (the part of `loaded` that came from the store, not generated)
+    };
+    void initStreaming();                   // empty infinite world: a flat floor, the window centred on region (0, 0)
+    // Recentres the window by whole regions (the player walked into a neighbouring one). Does not touch anything that
+    // holds positions outside the grid (player, bodies, particles, GPU data): the owner shifts those by -dRx*REGION etc.
+    ShiftResult shiftWindow(int dRx, int dRz);
+    bool regionLoaded(long long rx, long long rz) const;
+    size_t savedBytes() const;
+    long long globalX(float localX) const { return originX + (long long)std::floor(localX); }
+    long long globalZ(float localZ) const { return originZ + (long long)std::floor(localZ); }
 
     // ---- ray casting (Amanatides & Woo DDA over voxels) ------------------------------------------
     RayHit raycast(const Vec3& origin, const Vec3& dir, float maxDist, uint32_t materialMask) const;
@@ -229,6 +267,18 @@ public:
     std::vector<SimWorker> simWorkers;
 
 private:
+    int colSlot_[NCOL];     // logical chunk column -> physical block
+    int colLogical_[NCOL];  // and back
+    void resetColumns();
+    uint8_t* physChunk(int physCol, int cy);
+    void regionCounts(int rxl, int rzl, long long sign);
+    void generatedCounts(long long sign);  // what one generated region adds to (sign > 0) / removes from the counts
+    void generateRegionInto(int rxl, int rzl);
+    void saveRegionTo(int rxl, int rzl, std::vector<uint8_t>& out);
+    void loadRegionFrom(int rxl, int rzl, const std::vector<uint8_t>& in);
+    void wakeRegion(int rxl, int rzl);
+    void wakeSeam(int rxl, int rzl, int side);
+    bool regionIsNew(const ShiftResult& r, int rxl, int rzl) const;
     void markDirtyImpl(int x, int y, int z, std::vector<uint8_t>& meshFlags);
     void simTile(int tile, SimWorker& sw);
     int applyWaterHops(int maxHops);

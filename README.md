@@ -99,6 +99,25 @@ into several bodies, each inheriting the velocity of its piece.
 **Tools** — Creator: wireframe brush sphere, attaches to the targeted face or paints in free space (at a fixed distance).
 Gun: ray from the crosshair, red carve-radius preview, recoil + muzzle flash.
 
+**Endless world / chunk loading** (`Stream.cpp`, `GameStream.cpp`) — the game starts in an endless world (`--arena` brings back the classic walled arena;
+scripts and tests default to the arena, `--infinite` / script `infinite on` switch). The voxel grid is a window of 15 x 15 *regions* (one region = one
+32 x 32 chunk column, full 256 height, so 480 x 480 voxels) around you, and it slides as you walk - you are always within a region of its middle, so the
+loaded world reaches more than 200 voxels in every direction:
+* nothing is copied - a 225-entry table maps the window's chunk columns to storage blocks, so sliding the window permutes the table; coordinates inside the
+  window stay small (0..479) forever, so the simulation, physics, shaders etc. never see big numbers (the window's global origin is tracked separately);
+* the regions that fall off the window are saved if you ever changed anything in them (run-length compressed, in memory; untouched ones cost nothing and
+  are simply generated again), and their storage is reused for the regions that come into view, restored from the store or generated (a flat Permanent
+  Stone floor for now). Water, sand, rigid bodies, grass and everything else you left there are exactly as you left them when you come back;
+* the cellular sim and physics carry on across a slide (active lists are rebased, rigid bodies in unloaded regions are kept aside frozen, water that was
+  held back by the old edge of the window flows into the new region);
+* on the GPU the volume textures are copied (not re-uploaded) into the shifted position, retained chunk meshes are never rebuilt - each is drawn with a
+  per-instance translation - and only the newly loaded row of regions is meshed and uploaded. A slide costs about 1.5 ms of CPU and nothing you can see;
+* *Haze*: round distance fog from the eye (what you see is a dome, never the square of the window) - nothing for the first ~70 voxels, then a thin veil that
+  thickens until everything is swallowed just before the window's edge, easing in with neither slope nor curvature at the end so there is no visible rim
+  and nothing pops in or out. The haze is the colour of the sky in the direction you look, and below the horizon the "ground" is that same haze (darker
+  and bluer the further down you look, close to the floor's own tone), so distant voxels melt into it;
+* *Sky*: a deeper blue sky with soft drifting clouds (the light the sky casts is unchanged; the arena keeps its old plain sky and no fog).
+
 **Template world** — 256 × 256 × 1 Permanent Stone floor enclosed by 3-voxel-thick Normal Stone walls (160 voxels high).
 
 **Lighting** — directional sun with a 4096² shadow map (3×3 PCF), plus *ray-traced sky light*: the world occupancy is mirrored in a 3D
@@ -153,7 +172,7 @@ Chunk rebuilds are done in small slices so a big edit (a stone tower) spreads ov
 * `VoxelSandfall.exe --selftest` — headless regression tests (arena template, DDA ray casts, sand pile, water spread, player
   controller, sand footprints / craters / wading, water leveling in basins and trenches, wading / plunging / floating in water, rigid body stacking, island splitting, bodies on sand, …) → `selftest.log` next to the exe, exit code = failures.
 * `VoxelSandfall.exe --script file.txt [--size 1600x900] [--msaa 1|2|4|8]` — drives the real renderer without a human. Commands:
-  `prof` / `profreset` / `profiler on|off`, `cam x y z yawDeg pitchDeg`, `viewcam x y z yawDeg pitchDeg|off` (free camera), `look yaw pitch`, `walk|run seconds`, `fillsand` / `fillwater` / `fillstone x0 x1 y0 y1 z0 z1`, `dropwater x y z r` (ball of water), `dropstone x y z half` (rigid cube), `impacts on|off|nosoak`, `filldirt x0 x1 y0 y1 z0 z1`, `growgrass x y z r`, `material dirt|grass`, `quality auto|0..4`, `dumpfield file.png x0 x1 z0 z1`, `crater speed`, `freeze on|off`, `tool creator|gun`, `material sand|water|stone|bedrock`, `brush N`, `paint [n]`,
+  `prof` / `profreset` / `profiler on|off`, `cam x y z yawDeg pitchDeg`, `viewcam x y z yawDeg pitchDeg|off` (free camera), `look yaw pitch`, `walk|run seconds`, `fillsand` / `fillwater` / `fillstone x0 x1 y0 y1 z0 z1`, `dropwater x y z r` (ball of water), `dropstone x y z half` (rigid cube), `impacts on|off|nosoak`, `infinite on|off`, `tp globalX globalZ`, `filldirt x0 x1 y0 y1 z0 z1`, `growgrass x y z r`, `material dirt|grass`, `quality auto|0..4`, `dumpfield file.png x0 x1 z0 z1`, `crater speed`, `freeze on|off`, `tool creator|gun`, `material sand|water|stone|bedrock`, `brush N`, `paint [n]`,
   `fire [n]`, `carve x y z r`, `wait seconds`, `shot file.png`, `sun az el`, `rays n`, `hud on|off`, `log text`, `reset`, `quit`.
 * Other flags: `--rays N` (sky ray count, 0 = off), `--novsync`, `--autoquit seconds`. Diagnostics go to `voxelsandfall.log`.
 
@@ -168,9 +187,10 @@ Chunk rebuilds are done in small slices so a big edit (a stone tower) spreads ov
 | `Mesher.*` | greedy chunk meshing (parallel), per-vertex-AO meshing for rigid bodies, occupancy bricks |
 | `Parallel.h`, `Profile.h` | fork-join thread pool, CPU/GPU frame profiler |
 | `Renderer.*`, `ViewModel.*`, `Png.*` | Direct3D 11 renderer, procedural rifle, HUD, screenshots |
+| `Stream.cpp`, `GameStream.cpp` | endless world: region window, storage table, region save / load / generation, recentring of the sim, player, bodies |
 | `Config.h` | all tunables (arena size, gravity, speeds, tick rates) |
 
 ## Known limitations / ideas for later versions
 
 Rigid-body physics is single-threaded; very large floating islands (100k+ voxels) cost several ms per physics step;
-rigid bodies do not push the player and do not float; no sound; water leveling is line-of-sight based, so an isolated 1-voxel bump can remain.
+the endless world is a flat floor (no terrain generation yet) and its saved regions live in memory only (not on disk); rigid bodies do not push the player and do not float; no sound; water leveling is line-of-sight based, so an isolated 1-voxel bump can remain.

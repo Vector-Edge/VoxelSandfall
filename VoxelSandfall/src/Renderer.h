@@ -74,6 +74,7 @@ private:
         ComPtr<ID3D11Buffer> vb, ib;
         UINT indexCount = 0;
         UINT vbCap = 0, ibCap = 0;  // allocated bytes (buffers are reused and only grow)
+        float sx = 0, sz = 0;       // translation since it was built (the world window has moved; cleared by the next rebuild)
     };
     struct BodyGpu {
         GpuMesh mesh;
@@ -100,7 +101,9 @@ private:
                        const MeshData& md);
     void setObject(const Mat4& model, float r, float g, float b, float a, float volumeAO = 0);
     void drawSky();
-    void drawChunks(bool water, const Frustum* fr);
+    void drawChunks(bool water, const Frustum* fr, float volumeAO);
+    void applyShift(Game& g, int dRx, int dRz);  // the world window moved by whole regions: move the GPU data with it
+    void resetChunkGpu();
     void drawBodies(const Game& g);
     void drawParticles();
     void drawBrush(const Game& g);
@@ -134,6 +137,9 @@ private:
     ComPtr<ID3D11ShaderResourceView> shadowSRV_;
     ComPtr<ID3D11Texture3D> occTex_, brickTex_;
     ComPtr<ID3D11ShaderResourceView> occSRV_, brickSRV_;
+    ComPtr<ID3D11Texture3D> occTexB_, brickTexB_;  // the other half of a ping-pong pair: the window shifts by copying into it
+    ComPtr<ID3D11ShaderResourceView> occSRVB_, brickSRVB_;
+    uint32_t epoch_ = 0;
     ComPtr<ID3D11Texture2D> waterFieldTex_;           // ripples / foam / surface slope (see WaterField.h)
     ComPtr<ID3D11ShaderResourceView> waterFieldSRV_;
 
@@ -153,6 +159,9 @@ private:
 
     // geometry
     std::vector<GpuMesh> chunkOpaque_, chunkWater_;
+    ComPtr<ID3D11Buffer> chunkOffVB_;  // per-instance (x, z) translation of every chunk mesh (slot 1 of the world layout)
+    std::vector<float> chunkOff_;
+    bool chunkOffDirty_ = true;
     std::unordered_map<int, BodyGpu> bodyMeshes_;
     ComPtr<ID3D11Buffer> lineVB_, uiVB_;
     UINT lineCap_ = 0, uiCap_ = 0;
@@ -177,7 +186,7 @@ private:
     // parallel chunk meshing
     struct ChunkWork {
         int ci = 0;
-        bool mesh = false, waterOnly = false, tex = false;
+        bool mesh = false, waterOnly = false, tex = false, skipEmpty = false;
         MeshData opaque, water;
         uint8_t bricks[64];
         uint8_t tops[1024];  // open-water surface heights per column (waterTopsOfMesh)

@@ -639,6 +639,179 @@ void testGrass(Game& g) {
     CHECK(g.world.get(120, 6, 120) == M_DIRT && g.world.get(120, 5, 120) == M_DIRT, "grass under a stone dies back to dirt");
 }
 
+void addBox(std::vector<IVec3>& cells, int x0, int y0, int z0, int sx, int sy, int sz);
+
+// ---- chunk loading: the infinite world ------------------------------------------------------------------------
+// Global voxel -> local (window) coordinates.
+int lx(Game& g, long long gx) { return (int)(gx - g.world.originX); }
+int lz(Game& g, long long gz) { return (int)(gz - g.world.originZ); }
+
+// Puts the player at a global position (inside the window or not) and lets the game recentre the window.
+void walkTo(Game& g, long long gx, long long gz) {
+    g.player.pos.x = (float)(gx - g.world.originX);
+    g.player.pos.z = (float)(gz - g.world.originZ);
+    g.player.vel = Vec3(0, 0, 0);
+    g.update(1.0f / 120.0f, GameInput());
+}
+
+uint64_t hashRegion(Game& g, long long gx0, long long gz0, int sx, int sy, int sz) {
+    uint64_t h = 1469598103934665603ull;
+    for (int z = 0; z < sz; z++)
+        for (int y = 0; y < sy; y++)
+            for (int x = 0; x < sx; x++) {
+                h ^= (uint64_t)g.world.get(lx(g, gx0 + x), y, lz(g, gz0 + z));
+                h *= 1099511628211ull;
+            }
+    return h;
+}
+
+void testStreamingBasics(Game& g) {
+    tlog("[chunk loading: the window]\n");
+    g.setInfinite(true);
+    const int R = World::REGION, C = World::CENTER;
+    CHECK(g.world.streaming && g.infinite, "the infinite world is on");
+    long long floorVox = 0;
+    for (int z = 0; z < g.world.SZ; z++)
+        for (int x = 0; x < g.world.SX; x++) floorVox += g.world.get(x, 0, z) == M_BEDROCK && g.world.get(x, 1, z) == M_AIR;
+    CHECK(floorVox == (long long)g.world.SX * g.world.SZ, "the whole %d x %d region window has a floor (%lld voxels)", World::WIN_REGIONS, World::WIN_REGIONS, floorVox);
+    CHECK(g.world.counts[M_BEDROCK] == floorVox, "voxel counts are right (%lld)", g.world.counts[M_BEDROCK]);
+    CHECK(g.player.pos.x == (float)(cfg::WORLD_X / 2) && g.player.pos.z == (float)(cfg::WORLD_Z / 2), "the player starts in the middle of the window");
+    CHECK(lx(g, 0) == R * C && lz(g, 0) == R * C, "global (0, 0) is the corner of the middle region (local %d, %d)", lx(g, 0), lz(g, 0));
+    // a build in the middle region
+    for (int y = 1; y <= 30; y++)
+        for (int z = 8; z < 18; z++)
+            for (int x = 8; x < 18; x++) g.world.setRaw(lx(g, x), y, lz(g, z), M_STONE);
+    g.world.notifyBox(lx(g, 8), 1, lz(g, 8), lx(g, 17), 30, lz(g, 17));
+    const long long stone0 = g.world.counts[M_STONE];
+    const long long ox0 = g.world.originX, oz0 = g.world.originZ;
+    walkTo(g, 20, 34);   // still inside the middle region (with its margin): nothing moves
+    CHECK(g.regionsShifted == 0 && g.world.originX == ox0 && g.world.originZ == oz0, "walking around inside the middle region does not recentre the window");
+    walkTo(g, 20, 42);   // 10 voxels into the next region: the window slides by one region
+    CHECK(g.regionsShifted == 1 && g.world.originZ == oz0 + R && g.world.originX == ox0, "walking into a neighbouring region slides the window by one (origin %lld, %lld)", g.world.originX, g.world.originZ);
+    CHECK(g.playerGlobalX() == 20 && g.playerGlobalZ() == 42, "the player's global position did not change (%lld, %lld)", g.playerGlobalX(), g.playerGlobalZ());
+    CHECK(g.world.get(lx(g, 12), 15, lz(g, 12)) == M_STONE && g.world.get(lx(g, 12), 31, lz(g, 12)) == M_AIR, "the tower is at the same global position");
+    CHECK(g.world.counts[M_STONE] == stone0, "and nothing was lost (%lld stone)", g.world.counts[M_STONE]);
+    const int lastR = World::WIN_REGIONS - 1 - C;  // the window spans regions -C .. lastR in x, -C+1 .. lastR+1 in z now
+    CHECK(g.world.regionLoaded(0, lastR + 1) && g.world.regionLoaded(-C, lastR + 1) && !g.world.regionLoaded(0, -C) && !g.world.regionLoaded(lastR + 1, 0),
+          "the new row of regions is loaded, the far row behind is gone");
+    CHECK(g.world.get(lx(g, 8), 0, lz(g, (lastR + 1) * R + 5)) == M_BEDROCK, "the new regions have their floor");
+    // the player stays near the middle however often the window slides: walking on in one direction slides it region after region
+    const int shifts1 = g.regionsShifted;
+    for (int i = 1; i <= 5; i++) walkTo(g, 20, 42 + R * i);
+    CHECK(g.regionsShifted == shifts1 + 5 && g.player.pos.z >= (float)(C * R - 8) && g.player.pos.z < (float)((C + 1) * R + 8), "five more regions walked: five slides, the player is still mid-window (z %.0f)", g.player.pos.z);
+    long long floor2 = 0;
+    for (int z = 0; z < g.world.SZ; z++)
+        for (int x = 0; x < g.world.SX; x++) floor2 += g.world.get(x, 0, z) == M_BEDROCK;
+    CHECK(floor2 == (long long)g.world.SX * g.world.SZ && g.world.counts[M_BEDROCK] == floor2, "the floor is still complete and the counts are right (%lld)", floor2);
+}
+
+void testStreamingPersistence(Game& g) {
+    tlog("[chunk loading: what you build stays]\n");
+    g.setInfinite(true);
+    // a tower of stone, a pool of water, a heap of dirt and a rigid block, spread over the 3 x 3 regions at global (0..96)
+    for (int y = 1; y <= 40; y++)
+        for (int z = 20; z < 30; z++)
+            for (int x = 20; x < 30; x++) g.world.setRaw(lx(g, x), y, lz(g, z), M_STONE);
+    for (int y = 1; y <= 6; y++)  // a basin with a pool in it
+        for (int z = 59; z < 91; z++)
+            for (int x = 59; x < 91; x++) {
+                const bool wall = x == 59 || x == 90 || z == 59 || z == 90;
+                g.world.setRaw(lx(g, x), y, lz(g, z), wall ? M_STONE : (y <= 4 ? M_WATER : M_AIR));
+            }
+    for (int y = 1; y <= 10; y++)
+        for (int z = 10; z < 20; z++)
+            for (int x = 60; x < 70; x++) g.world.setRaw(lx(g, x), y, lz(g, z), M_DIRT);
+    g.world.notifyBox(lx(g, 0), 1, lz(g, 0), lx(g, 95), 45, lz(g, 95));
+    std::vector<IVec3> cells;
+    addBox(cells, lx(g, 10), 5, lz(g, 70), 6, 6, 6);
+    Body* body = g.physics.createFromWorldCells(cells);
+    const int bodyId = body->id;
+    settle(g, 4000);
+    runPhysics(g, 1.0f);
+    const uint64_t h0 = hashRegion(g, 0, 0, 96, 60, 96);
+    const long long stone0 = g.world.counts[M_STONE], water0 = g.world.counts[M_WATER], dirt0 = g.world.counts[M_DIRT];
+    const Vec3 bodyGlobal0 = body->pos + Vec3((float)g.world.originX, 0, (float)g.world.originZ);
+    // go far away (the whole window is replaced): the regions are saved and leave the window
+    walkTo(g, 500, 16);
+    CHECK(g.world.originX == 256 && !g.world.regionLoaded(0, 0) && !g.world.regionLoaded(2, 2), "far away: the starting regions are not loaded any more (origin %lld)", g.world.originX);
+    CHECK(g.world.savedRegions.size() >= 4, "they were saved (%zu regions, %.1f KB)", g.world.savedRegions.size(), (double)g.world.savedBytes() / 1024.0);
+    CHECK(g.world.counts[M_STONE] == 0 && g.world.counts[M_WATER] == 0 && g.world.counts[M_DIRT] == 0, "their voxels are no longer counted");
+    CHECK(g.stashedBodies() == 1 && g.physics.bodies.empty(), "the rigid block is kept aside (%zu)", g.stashedBodies());
+    // an unmodified far region is not stored at all
+    const size_t saved1 = g.world.savedRegions.size();
+    walkTo(g, 32 * 40 + 16, 16);
+    CHECK(g.world.savedRegions.size() == saved1, "untouched regions are never stored (they are generated again when needed)");
+    // and back again
+    walkTo(g, 48, 48);
+    CHECK(g.world.regionLoaded(0, 0) && g.world.regionLoaded(2, 2), "back home: the starting regions are loaded again");
+    const uint64_t h1 = hashRegion(g, 0, 0, 96, 60, 96);
+    CHECK(h0 == h1, "every voxel of them is exactly as it was (%016llx)", (unsigned long long)h1);
+    CHECK(g.world.counts[M_STONE] == stone0 && g.world.counts[M_WATER] == water0 && g.world.counts[M_DIRT] == dirt0, "with the same counts (stone %lld, water %lld, dirt %lld)", g.world.counts[M_STONE], g.world.counts[M_WATER], g.world.counts[M_DIRT]);
+    CHECK(g.stashedBodies() == 0 && g.physics.bodies.size() == 1 && g.physics.bodies[0]->id == bodyId, "and the rigid block is back");
+    if (!g.physics.bodies.empty()) {
+        const Body& b = *g.physics.bodies[0];
+        const Vec3 gl = b.pos + Vec3((float)g.world.originX, 0, (float)g.world.originZ);
+        CHECK(length(gl - bodyGlobal0) < 1.0f, "at the same place (moved %.2f voxels)", length(gl - bodyGlobal0));
+    }
+}
+
+void testStreamingSimulation(Game& g) {
+    tlog("[chunk loading: the simulation carries on across a recentring]\n");
+    g.setInfinite(true);
+    // water and sand falling east of the start, clear of the player: sliding the window must not freeze or lose any of it
+    long long water = 0, sand = 0;
+    for (int y = 1; y <= 12; y++)
+        for (int z = 0; z < 30; z++)
+            for (int x = 60; x < 85; x++) {
+                g.world.setRaw(lx(g, x), y + 20, lz(g, z), M_WATER);
+                water++;
+            }
+    for (int y = 1; y <= 12; y++)
+        for (int z = 0; z < 20; z++)
+            for (int x = 100; x < 120; x++) {
+                g.world.setRaw(lx(g, x), y + 15, lz(g, z), M_SAND);
+                sand++;
+            }
+    g.world.notifyBox(lx(g, 55), 1, lz(g, -5), lx(g, 125), 40, lz(g, 35));
+    runSim(g, 40);  // in the air, falling
+    const int shifts0 = g.regionsShifted;
+    walkTo(g, -12, 16);  // slide the window west while it is all in motion
+    CHECK(g.regionsShifted == shifts0 + 1, "the window slid while water and sand were falling");
+    runGame(g, 4.0f, GameInput());  // (droplets thrown up by the splashes land again)
+    settle(g, 20000);
+    CHECK(g.world.counts[M_WATER] == water && g.world.counts[M_SAND] == sand, "nothing lost or frozen (water %lld/%lld, sand %lld/%lld)", g.world.counts[M_WATER], water, g.world.counts[M_SAND], sand);
+    int floating = 0;
+    for (int z = 0; z < g.world.SZ; z++)
+        for (int y = 1; y < 50; y++)
+            for (int x = 0; x < g.world.SX; x++)
+                if (g.world.get(x, y, z) == M_SAND && g.world.get(x, y - 1, z) == M_AIR) floating++;
+    CHECK(floating < 20, "everything came to rest (%d suspended sand voxels)", floating);
+    // a pool at the very edge of the window is held back by it, and flows on once the next regions are loaded
+    g.setInfinite(true);
+    const long long edge = g.world.originX + g.world.SX;  // first global x that is not loaded
+    long long w2 = 0;
+    for (int y = 1; y <= 8; y++)
+        for (int z = 60; z < 110; z++)
+            for (int x = (int)edge - 22; x < (int)edge; x++) {
+                const bool wall = x == (int)edge - 22 || z == 60 || z == 109;
+                g.world.setRaw(lx(g, x), y, lz(g, z), wall ? M_STONE : M_WATER);
+                if (!wall) w2++;
+            }
+    g.world.notifyBox(lx(g, edge - 24), 1, lz(g, 58), g.world.SX - 1, 12, lz(g, 111));
+    settle(g, 20000);
+    int past = 0;
+    for (int z = 0; z < g.world.SZ; z++)
+        for (int x = 0; x < g.world.SX; x++) past += (g.world.get(x, 1, z) == M_WATER && g.world.originX + x >= edge);
+    CHECK(g.world.counts[M_WATER] == w2 && past == 0, "a pool at the edge of the window is held by it (%lld voxels, %d beyond)", g.world.counts[M_WATER], past);
+    walkTo(g, edge - 6, 10);  // walk east (clear of the pool): the next regions are loaded
+    runGame(g, 2.0f, GameInput());
+    settle(g, 20000);
+    past = 0;
+    for (int z = 0; z < g.world.SZ; z++)
+        for (int x = 0; x < g.world.SX; x++) past += (g.world.get(x, 1, z) == M_WATER && g.world.originX + x >= edge);
+    CHECK(g.world.counts[M_WATER] == w2 && past > 100, "...and flows on into the new region once it is loaded (%d voxels beyond the old edge, %lld in total)", past, g.world.counts[M_WATER]);
+}
+
 void testWadingInWater(Game& g) {
     tlog("[wading through water]\n");
     g.reset();
@@ -1033,6 +1206,10 @@ int runSelfTest(const char* logPath) {
         testWaterImpact(*g);
         testWaterField(*g);
         testWaterSplash(*g);
+        testStreamingBasics(*g);
+        testStreamingPersistence(*g);
+        testStreamingSimulation(*g);
+        g->setInfinite(false);
         testDirtPile(*g);
         testDirtStructure(*g);
         testGrass(*g);
